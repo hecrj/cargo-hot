@@ -8,7 +8,7 @@ use cargo::GlobalContext;
 use cargo::core::{Target, TargetKind, Workspace};
 use cargo::util::{Filesystem, command_prelude::*};
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use itertools::Itertools;
 use serde::Deserialize;
 use target_lexicon::{Architecture, OperatingSystem, Triple};
@@ -25,6 +25,7 @@ use std::time::{Duration, SystemTime};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(debug_assertions)]
     tracing_subscriber::fmt::init();
 
     if rustc::is_wrapping_rustc() {
@@ -33,11 +34,16 @@ async fn main() -> Result<()> {
     }
 
     let gctx = GlobalContext::default()?;
-
     let _token = cargo::util::job::setup();
 
-    // TODO: Get rid of this terrible hack
-    let args = command().try_get_matches_from(env::args_os().filter(|arg| arg != "hot"))?;
+    let matches = Command::new("cargo")
+        .bin_name("cargo")
+        .subcommand(command())
+        .try_get_matches()?;
+
+    let (_, args) = matches
+        .subcommand()
+        .ok_or(anyhow!("`cargo-hot` must be called with `hot` subcommand"))?;
 
     let ws = args.workspace(&gctx)?;
     let server = Server::new(&gctx, ws, &args).await?;
@@ -101,12 +107,10 @@ pub struct Server {
 
 #[derive(Clone, Debug)]
 pub struct Build {
-    pub(crate) exe: PathBuf,
-    pub(crate) direct_rustc: rustc::Args,
-    pub(crate) time_start: SystemTime,
-    // pub(crate) time_end: SystemTime,
-    // pub(crate) mode: BuildMode,
-    pub(crate) patch_cache: Option<Arc<hotpatch::Cache>>,
+    exe: PathBuf,
+    direct_rustc: rustc::Args,
+    time_start: SystemTime,
+    patch_cache: Option<Arc<hotpatch::Cache>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -195,6 +199,7 @@ impl Server {
                 }).collect::<Vec<_>>();
 
                 filtered_packages.join(", ")};
+
                 if let Some(example) = &args.get_one::<String>("example"){
                     let examples = target_of_kind(&TargetKind::ExampleBin);
                     format!("Failed to find example {example}. \nAvailable examples are:\n{}", examples)
@@ -255,6 +260,7 @@ impl Server {
 
         let extra_cargo_args = vec![]; // TODO
 
+        // TODO
         let extra_rustc_args = cargo_config
             .rustflags(triple.to_string())
             .unwrap_or_default()
@@ -294,7 +300,6 @@ impl Server {
         })?;
 
         let build = self.build(BuildMode::Fat).await?;
-
         let _ = tokio::process::Command::new(self.main_exe()).spawn()?;
 
         watcher.watch(
@@ -344,22 +349,9 @@ impl Server {
                 continue;
             }
 
-            let patch = self
-                .build(BuildMode::Thin {
-                    rustc_args: build.direct_rustc.clone(),
-                    changed_files: changed_files.into_iter().collect(),
-                    aslr_reference: connection.aslr_reference() as u64,
-                    cache: build.patch_cache.clone().unwrap(),
-                })
-                .await?;
-
-            let jump_table = hotpatch::create_jump_table(
-                &self.patch_exe(patch.time_start),
-                &self.triple,
-                build.patch_cache.as_ref().unwrap(),
-            )?;
-
-            connection.patch(&jump_table).await?;
+            if let Err(error) = self.patch(&build, changed_files, &mut connection).await {
+                log::error!("{error}");
+            }
         }
 
         Ok(())
@@ -391,17 +383,6 @@ impl Server {
                     .await
                     .context("Failed to write main executable")?;
 
-                // TODO
-                // self.write_metadata().await?;
-
-                // TODO
-                // self.optimize().await?;
-
-                // TODO
-                // self.assemble()
-                //     .await
-                //     .context("Failed to assemble app bundle")?;
-
                 log::debug!("Binary created at {}", self.build_dir().display());
             }
         }
@@ -412,6 +393,32 @@ impl Server {
         }
 
         Ok(build)
+    }
+
+    async fn patch(
+        &self,
+        build: &Build,
+        changed_files: BTreeSet<PathBuf>,
+        connection: &mut server::Connection,
+    ) -> Result<()> {
+        let patch = self
+            .build(BuildMode::Thin {
+                rustc_args: build.direct_rustc.clone(),
+                changed_files: changed_files.into_iter().collect(),
+                aslr_reference: connection.aslr_reference() as u64,
+                cache: build.patch_cache.clone().unwrap(),
+            })
+            .await?;
+
+        let jump_table = hotpatch::create_jump_table(
+            &self.patch_exe(patch.time_start),
+            &self.triple,
+            build.patch_cache.as_ref().unwrap(),
+        )?;
+
+        let _ = connection.patch(&jump_table).await;
+
+        Ok(())
     }
 
     async fn create_patch_cache(&self, exe: &Path) -> Result<hotpatch::Cache> {
@@ -452,14 +459,14 @@ impl Server {
         let mut output_location: Option<PathBuf> = None;
         let mut stdout = stdout.lines();
         let mut stderr = stderr.lines();
-        // let mut emitting_error = false;
+        let mut emitting_error = false;
 
         // TODO
         // let mut units_compiled = 0;
 
         loop {
             use cargo_metadata::Message;
-            // use cargo_metadata::diagnostic::Diagnostic;
+            use cargo_metadata::diagnostic::Diagnostic;
 
             let line = tokio::select! {
                 Ok(Some(line)) = stdout.next_line() => line,
@@ -476,7 +483,7 @@ impl Server {
                     // TODO
                     // units_compiled += 1;
                 }
-                Message::CompilerMessage(msg) => eprintln!("{}", msg.message),
+                Message::CompilerMessage(msg) => println!("{}", msg.message),
                 Message::TextLine(line) => {
                     // Handle the case where we're getting lines directly from rustc.
                     // These are in a different format than the normal cargo output, though I imagine
@@ -495,13 +502,17 @@ impl Server {
                     if let Ok(artifact) = serde_json::from_str::<RustcArtifact>(&line) {
                         if artifact.emit == "link" {
                             output_location = Some(artifact.artifact);
+                            continue;
                         }
                     }
 
                     // Handle direct rustc diagnostics
-                    // if let Ok(diag) = serde_json::from_str::<Diagnostic>(&line) {
-                    //     // eprintln!("{diag}");
-                    // }
+                    if let Ok(diag) = serde_json::from_str::<Diagnostic>(&line) {
+                        if let Some(rendered) = diag.rendered {
+                            println!("{}", rendered);
+                            continue;
+                        }
+                    }
 
                     // For whatever reason, if there's an error while building, we still receive the TextLine
                     // instead of an "error" message. However, the following messages *also* tend to
@@ -512,15 +523,15 @@ impl Server {
                     // into a more reliable way to detect errors propagating out of the compiler. If
                     // we always wrapped rustc, then we could store this data somewhere in a much more
                     // reliable format.
-                    // if line.trim_start().starts_with("error:") {
-                    //     emitting_error = true;
-                    // }
+                    if line.trim_start().starts_with("error:") {
+                        emitting_error = true;
+                    }
 
-                    // // Note that previous text lines might have set emitting_error to true
-                    // match emitting_error {
-                    //     true => eprintln!("{line}"),
-                    //     false => println!("{line}"),
-                    // }
+                    // Note that previous text lines might have set emitting_error to true
+                    match emitting_error {
+                        true => eprintln!("{line}"),
+                        false => println!("{line}"),
+                    }
                 }
                 Message::CompilerArtifact(artifact) => {
                     // TODO
@@ -1497,6 +1508,8 @@ impl Server {
                     .current_dir(&self.crate_dir)
                     .arg("--message-format")
                     .arg("json-diagnostic-rendered-ansi")
+                    .arg("--color")
+                    .arg("always")
                     .args(self.cargo_build_arguments(mode))
                     .envs(self.cargo_build_env_vars(mode)?);
 
