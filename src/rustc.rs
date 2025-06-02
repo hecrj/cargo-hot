@@ -48,7 +48,7 @@ pub async fn run_rustc() {
         .expect("DX_RUSTC not set")
         .into();
 
-    let rustc_args = Args {
+    let mut rustc_args = Args {
         args: args().skip(1).collect::<Vec<_>>(),
         envs: vars().collect::<_>(),
         link_args: Default::default(),
@@ -64,6 +64,10 @@ pub async fn run_rustc() {
         .next()
         .is_some_and(|name| name != "___")
     {
+        rustc_args
+            .envs
+            .retain_mut(|(key, _)| key != "CARGO_MAKEFLAGS");
+
         std::fs::create_dir_all(var_file.parent().expect("Failed to get parent dir"))
             .expect("Failed to create parent dir");
         std::fs::write(

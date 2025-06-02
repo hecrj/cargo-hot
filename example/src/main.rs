@@ -2,7 +2,7 @@ use std::thread;
 use std::time::Duration;
 
 fn main() {
-    cargo_hot::inject();
+    cargo_hot_protocol::inject();
 
     loop {
         subsecond::call(|| {

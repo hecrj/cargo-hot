@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-cargo-hot = { path = ".." }
-subsecond = "0.7.0-alpha.1"
+cargo-hot-protocol.workspace = true
+subsecond.workspace = true

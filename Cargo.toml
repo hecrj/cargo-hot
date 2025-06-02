@@ -6,9 +6,58 @@ description = "Coming soon!"
 license = "MIT"
 
 [dependencies]
+anyhow.workspace = true
+ar.workspace = true
+bincode.workspace = true
+cargo.workspace = true
+cargo-config2.workspace = true
+cargo_metadata.workspace = true
+clap.workspace = true
+color-print.workspace = true
+dunce.workspace = true
+itertools.workspace = true
+log.workspace = true
+notify.workspace = true
+pdb.workspace = true
+rayon.workspace = true
+serde_json.workspace = true
+subsecond.workspace = true
+subsecond-types.workspace = true
+target-lexicon.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tracing-subscriber.workspace = true
+wasmparser.workspace = true
+which.workspace = true
+
+cargo-hot-protocol.workspace = true
+cargo-hot-protocol.features = ["server"]
+
+object.workspace = true
+object.features = ["write_core"]
+
+serde.workspace = true
+serde.features = ["derive"]
+
+tokio.workspace = true
+tokio.features = ["rt-multi-thread", "io-util", "macros", "net", "process", "sync", "time"]
+
+uuid.workspace = true
+uuid.features = ["v5"]
+
+walrus.workspace = true
+walrus.features = ["parallel"]
+
+
+[workspace]
+members = ["example", "protocol"]
+
+[workspace.dependencies]
+cargo-hot-protocol = { path = "./protocol" }
+
 anyhow = "1"
 ar = "0.9"
-bincode = "1"
+bincode = "2"
 cargo = "0.88"
 cargo-config2 = "0.1"
 cargo_metadata = "0.20"
@@ -18,32 +67,19 @@ dunce = "1"
 itertools = "0.14"
 log = "0.4"
 notify = "8"
+object = "0.36"
 pdb = "0.8"
 rayon = "1.10"
+serde = "1"
 serde_json = "1"
 subsecond = "0.7.0-alpha.1"
 subsecond-types = "0.7.0-alpha.1"
 target-lexicon = "0.13"
 tempfile = "3.20"
 thiserror = "2.0"
+tokio = "1.45"
 tracing-subscriber = "0.3"
+uuid = "1.17"
+walrus = "0.23"
 wasmparser = "0.232"
 which = "7"
-
-object.version = "0.36"
-object.features = ["write_core"]
-
-serde.version = "1"
-serde.features = ["derive"]
-
-tokio.version = "1.45"
-tokio.features = ["rt-multi-thread", "io-util", "macros", "net", "process", "sync", "time"]
-
-uuid.version = "1.17"
-uuid.features = ["v5"]
-
-walrus.version = "0.23"
-walrus.features = ["parallel"]
-
-[workspace]
-members = ["example"]

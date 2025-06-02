@@ -1,0 +1,19 @@
+[package]
+name = "cargo-hot-protocol"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+server = ["dep:tokio"]
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+subsecond.workspace = true
+
+bincode.workspace = true 
+bincode.features = ["serde"]
+
+tokio.workspace = true
+tokio.features = ["net", "io-util"]
+tokio.optional = true

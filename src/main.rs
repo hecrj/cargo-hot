@@ -2,7 +2,7 @@ use cargo_hot::Result;
 use cargo_hot::hotpatch;
 use cargo_hot::link::{self, LinkerFlavor};
 use cargo_hot::rustc;
-use cargo_hot::server;
+use cargo_hot_protocol::server;
 
 use cargo::GlobalContext;
 use cargo::core::{Target, TargetKind, Workspace};
@@ -488,16 +488,18 @@ impl Server {
                     if let Ok(artifact) = serde_json::from_str::<RustcArtifact>(&line) {
                         if artifact.emit == "link" {
                             output_location = Some(artifact.artifact);
-                            continue;
                         }
+
+                        continue;
                     }
 
                     // Handle direct rustc diagnostics
                     if let Ok(diag) = serde_json::from_str::<Diagnostic>(&line) {
                         if let Some(rendered) = diag.rendered {
                             println!("{}", rendered);
-                            continue;
                         }
+
+                        continue;
                     }
 
                     // For whatever reason, if there's an error while building, we still receive the TextLine
