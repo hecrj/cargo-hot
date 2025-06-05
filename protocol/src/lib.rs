@@ -1,3 +1,5 @@
+pub use subsecond;
+
 #[cfg(feature = "server")]
 pub mod server;
 
@@ -10,7 +12,7 @@ use std::net;
 use std::thread;
 use std::time::Duration;
 
-pub fn inject() {
+pub fn connect() {
     let aslr_reference = subsecond::aslr_reference();
 
     // TODO: Wasm support

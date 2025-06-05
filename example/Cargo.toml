@@ -5,4 +5,3 @@ edition = "2024"
 
 [dependencies]
 cargo-hot-protocol.workspace = true
-subsecond.workspace = true

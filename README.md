@@ -1,6 +1,6 @@
 # cargo-hot
 
-A very experimental attempt at implementing the `subsecond` server protocol as a standalone `cargo` command.
+A very experimental attempt at implementing the [`subsecond`] server protocol as a standalone `cargo` command.
 
 Currently just an exploration. Very broken! Will eat your laundry!
 
@@ -11,3 +11,4 @@ Most of the code is taken from their [`dioxus-cli`] tool.
 
 [Dioxus]: https://github.com/DioxusLabs/dioxus
 [`dioxus-cli`]: https://github.com/DioxusLabs/dioxus/tree/main/packages/cli
+[`subsecond`]: https://docs.rs/subsecond/0.7.0-alpha.1/subsecond/index.html
