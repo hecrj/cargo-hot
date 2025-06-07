@@ -94,6 +94,7 @@ pub struct Server {
     triple: Triple,
     package: String,
     features: Vec<String>,
+    exe_args: Vec<OsString>,
     extra_cargo_args: Vec<String>,
     extra_rustc_args: Vec<String>,
     no_default_features: bool,
@@ -238,6 +239,14 @@ impl Server {
             .unwrap_or_else(|| workspace.target_dir());
 
         let custom_linker = cargo_config.linker(triple.to_string())?;
+
+        let exe_args = args
+            .get_many("args")
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+
         let extra_cargo_args = vec![]; // TODO
 
         // TODO
@@ -259,6 +268,7 @@ impl Server {
                 .get_many("features")
                 .map(|features| features.into_iter().cloned().collect())
                 .unwrap_or_default(),
+            exe_args,
             extra_cargo_args,
             extra_rustc_args,
             no_default_features: args.get_flag("no-default-features"),
@@ -291,7 +301,9 @@ impl Server {
         })?;
 
         let build = self.build(BuildMode::Fat).await?;
-        let _ = tokio::process::Command::new(self.main_exe()).spawn()?;
+        let _ = tokio::process::Command::new(self.main_exe())
+            .args(&self.exe_args)
+            .spawn()?;
 
         watcher.watch(
             self.crate_target
