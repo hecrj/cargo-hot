@@ -19,17 +19,18 @@ use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<ExitCode> {
     #[cfg(debug_assertions)]
     tracing_subscriber::fmt::init();
 
     if rustc::is_wrapping_rustc() {
         rustc::run_rustc().await;
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
     let gctx = GlobalContext::default()?;
@@ -277,7 +278,7 @@ impl Server {
         })
     }
 
-    async fn run(self) -> Result<()> {
+    async fn run(self) -> Result<ExitCode> {
         use notify::Watcher;
 
         std::fs::create_dir_all(self.exe_dir())?;
@@ -301,7 +302,7 @@ impl Server {
         })?;
 
         let build = self.build(BuildMode::Fat).await?;
-        let _ = tokio::process::Command::new(self.main_exe())
+        let mut executable = tokio::process::Command::new(self.main_exe())
             .args(&self.exe_args)
             .spawn()?;
 
@@ -319,10 +320,15 @@ impl Server {
         let mut buffer = Vec::new();
 
         loop {
-            let n = read_batch(&mut receiver, &mut buffer, Duration::from_millis(100)).await;
+            let n = tokio::select! {
+                n = read_batch(&mut receiver, &mut buffer, Duration::from_millis(100)) => n,
+                status = executable.wait() => {
+                    return Ok(status?.code().map(|code| ExitCode::from(code as u8)).unwrap_or_default())
+                }
+            };
 
             if n == 0 {
-                break;
+                return Err(anyhow!("file notifier failed"));
             }
 
             let changed_files: BTreeSet<PathBuf> = buffer
@@ -356,8 +362,6 @@ impl Server {
                 log::error!("{error}");
             }
         }
-
-        Ok(())
     }
 
     async fn build(&self, mode: BuildMode) -> Result<Build> {
