@@ -23,10 +23,10 @@ pub fn connect() {
         thread::spawn(move || {
             loop {
                 if let Err(error) = run(aslr_reference) {
-                    log::error!("connection lost: {error}");
+                    log::trace!("connection lost: {error}");
                 }
 
-                thread::sleep(Duration::from_secs(1));
+                thread::sleep(Duration::from_secs(5));
             }
         });
     });
@@ -53,8 +53,12 @@ fn run(aslr_reference: usize) -> Result<()> {
         let (patch, _): (JumpTable, _) =
             bincode::serde::decode_from_slice(&buffer[..n], bincode::config::standard())?;
 
+        let entries = patch.map.len();
+
         unsafe {
             subsecond::apply_patch(patch)?;
         }
+
+        log::info!("Hotpatch applied ({entries} entries)");
     }
 }
