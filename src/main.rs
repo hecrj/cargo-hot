@@ -106,6 +106,7 @@ pub struct Server {
 #[derive(Clone, Debug)]
 pub struct Build {
     exe: PathBuf,
+    is_fresh: bool,
     direct_rustc: rustc::Args,
     time_start: SystemTime,
     patch_cache: Option<Arc<hotpatch::Cache>>,
@@ -113,7 +114,6 @@ pub struct Build {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum BuildMode {
-    Base,
     Fat,
     Thin {
         rustc_args: rustc::Args,
@@ -380,18 +380,20 @@ impl Server {
                     .await?;
             }
 
-            BuildMode::Base | BuildMode::Fat => {
-                self.write_executable(&build.exe)
-                    .await
-                    .context("Failed to write main executable")?;
+            BuildMode::Fat => {
+                if !build.is_fresh {
+                    self.write_executable(&build.exe)
+                        .await
+                        .context("Failed to write main executable")?;
 
-                log::debug!("Binary created at {}", self.build_dir().display());
+                    log::debug!("Binary created at {}", self.build_dir().display());
+                }
             }
         }
 
         // Populate the patch cache if we're in fat mode
         if matches!(mode, BuildMode::Fat) {
-            build.patch_cache = Some(Arc::new(self.create_patch_cache(&build.exe).await?));
+            build.patch_cache = Some(Arc::new(self.create_patch_cache().await?));
         }
 
         Ok(build)
@@ -423,9 +425,9 @@ impl Server {
         Ok(())
     }
 
-    async fn create_patch_cache(&self, exe: &Path) -> Result<hotpatch::Cache> {
+    async fn create_patch_cache(&self) -> Result<hotpatch::Cache> {
         // TODO: Wasm
-        let exe = exe.to_path_buf();
+        let exe = self.main_exe().to_path_buf();
 
         Ok(hotpatch::Cache::new(&exe, &self.triple)?)
     }
@@ -609,6 +611,7 @@ impl Server {
 
         Ok(Build {
             exe,
+            is_fresh: !has_compiled,
             direct_rustc,
             time_start,
             patch_cache: None,
