@@ -48,7 +48,6 @@ uuid.features = ["v5"]
 walrus.workspace = true
 walrus.features = ["parallel"]
 
-
 [workspace]
 members = ["example", "protocol"]
 

@@ -80,6 +80,15 @@ fn command() -> Command {
         .arg_ignore_rust_version()
         .arg_unit_graph()
         .arg_timings()
+        .arg(
+            opt(
+                "verbose",
+                "Use verbose output (-vv very verbose/build.rs output)",
+            )
+            .short('v')
+            .action(ArgAction::Count)
+            .global(true),
+        )
         .after_help(color_print::cstr!(
             "Run `<cyan,bold>cargo help run</>` for more detailed information.\n"
         ))
@@ -98,6 +107,7 @@ pub struct Server {
     exe_args: Vec<OsString>,
     extra_cargo_args: Vec<String>,
     extra_rustc_args: Vec<String>,
+    verbose: u8,
     no_default_features: bool,
     target_dir: Filesystem,
     custom_linker: Option<PathBuf>,
@@ -272,6 +282,7 @@ impl Server {
             exe_args,
             extra_cargo_args,
             extra_rustc_args,
+            verbose: args.get_count("verbose"),
             no_default_features: args.get_flag("no-default-features"),
             target_dir,
             custom_linker,
@@ -1549,7 +1560,9 @@ impl Server {
         cargo_args.push(self.triple.to_string());
 
         // We always run in verbose since the CLI itself is the one doing the presentation
-        cargo_args.push("--verbose".to_string());
+        if self.verbose > 0 {
+            cargo_args.push(format!("-{}", "v".repeat(usize::from(self.verbose))));
+        }
 
         if self.no_default_features {
             cargo_args.push("--no-default-features".to_string());
