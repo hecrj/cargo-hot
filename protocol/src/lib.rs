@@ -45,13 +45,17 @@ fn run(aslr_reference: usize) -> Result<()> {
     loop {
         server.read_exact(&mut size)?;
 
+        let start = std::time::Instant::now();
         let n = usize::from_be_bytes(size);
-        buffer.resize(n, 0);
 
+        buffer.resize(n, 0);
         server.read_exact(&mut buffer[..n])?;
+
+        log::trace!("Read patch with {n} bytes in {:?}", start.elapsed());
 
         let (patch, _): (JumpTable, _) =
             bincode::serde::decode_from_slice(&buffer[..n], bincode::config::standard())?;
+        log::trace!("Decoded jumptable in {:?}", start.elapsed());
 
         let entries = patch.map.len();
 
@@ -59,6 +63,9 @@ fn run(aslr_reference: usize) -> Result<()> {
             subsecond::apply_patch(patch)?;
         }
 
-        log::info!("Hotpatch applied ({entries} entries)");
+        log::info!(
+            "Hotpatch applied ({entries} entries) in {:?}",
+            start.elapsed()
+        );
     }
 }
