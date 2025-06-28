@@ -5,7 +5,7 @@ use cargo_hot::rustc;
 use cargo_hot_protocol::server;
 
 use cargo::GlobalContext;
-use cargo::core::{Target, TargetKind, Workspace};
+use cargo::core::{Target, TargetKind};
 use cargo::util::{Filesystem, command_prelude::*};
 
 use anyhow::{Context, anyhow};
@@ -21,7 +21,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
@@ -45,8 +45,7 @@ async fn main() -> Result<ExitCode> {
         .subcommand()
         .ok_or(anyhow!("`cargo-hot` must be called with `hot` subcommand"))?;
 
-    let ws = args.workspace(&gctx)?;
-    let server = Server::new(&gctx, ws, &args).await?;
+    let server = Server::new(gctx, &args).await?;
 
     server.run().await
 }
@@ -96,6 +95,7 @@ fn command() -> Command {
 
 #[derive(Debug)]
 pub struct Server {
+    gctx: GlobalContext,
     sysroot: PathBuf,
     crate_target: Target,
     crate_dir: PathBuf,
@@ -134,11 +134,7 @@ pub enum BuildMode {
 }
 
 impl Server {
-    async fn new(
-        gcxt: &GlobalContext,
-        workspace: Workspace<'_>,
-        args: &ArgMatches,
-    ) -> Result<Self> {
+    async fn new(gctx: GlobalContext, args: &ArgMatches) -> Result<Self> {
         let sysroot = process::Command::new("rustc")
             .args(["--print", "sysroot"])
             .output()
@@ -152,8 +148,10 @@ impl Server {
             TargetKind::Bin
         };
 
+        let workspace = args.workspace(&gctx)?;
+
         let compile_opts = args.compile_options(
-            gcxt,
+            &gctx,
             CompileMode::Build,
             Some(&workspace),
             ProfileChecking::Custom,
@@ -267,11 +265,15 @@ impl Server {
             .unwrap_or_default()
             .flags;
 
+        let crate_dir = main_package.manifest_path().parent().unwrap().to_path_buf();
+        let workspace_dir = workspace.root_manifest().parent().unwrap().to_path_buf();
+
         Ok(Self {
+            gctx,
             sysroot: PathBuf::from(sysroot),
             crate_target,
-            crate_dir: main_package.manifest_path().parent().unwrap().to_path_buf(),
-            workspace_dir: workspace.root_manifest().parent().unwrap().to_path_buf(),
+            crate_dir,
+            workspace_dir,
             profile,
             triple,
             package,
@@ -369,8 +371,31 @@ impl Server {
                 continue;
             }
 
-            if let Err(error) = self.patch(&build, changed_files, &mut connection).await {
-                log::error!("{error}");
+            let _ = self.gctx.shell().status(
+                "Patching",
+                format!(
+                    "{} ({})",
+                    self.crate_target.name(),
+                    self.crate_dir.display(),
+                ),
+            );
+
+            let start = Instant::now();
+
+            match self.patch(&build, changed_files, &mut connection).await {
+                Ok(()) => {
+                    let _ = self.gctx.shell().status(
+                        "Finished",
+                        format!(
+                            "`{}` profile target(s) in {:.2}s",
+                            self.profile,
+                            start.elapsed().as_millis() as f32 / 1_000.0
+                        ),
+                    );
+                }
+                Err(error) => {
+                    log::error!("{error}");
+                }
             }
         }
     }
