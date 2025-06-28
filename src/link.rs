@@ -146,7 +146,7 @@ impl LinkAction {
         match self.linker {
             Some(linker) => {
                 let mut cmd = std::process::Command::new(linker);
-                match cfg!(target_os = "windows") {
+                let _ = match cfg!(target_os = "windows") {
                     true => cmd.arg(format!("@{}", &self.link_args_file.display())),
                     false => cmd.args(args.iter().skip(1)),
                 };

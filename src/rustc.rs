@@ -81,13 +81,14 @@ pub async fn run_rustc() {
     //
     // Note that the args format we get from the wrapper includes the `rustc` command itself, so we
     // need to skip that - we already skipped the first arg when we created the args struct.
-    let mut cmd = std::process::Command::new("rustc");
-    cmd.args(rustc_args.args.iter().skip(1));
-    cmd.envs(rustc_args.envs);
-    cmd.stdout(std::process::Stdio::inherit());
-    cmd.stderr(std::process::Stdio::inherit());
-    cmd.current_dir(std::env::current_dir().expect("Failed to get current dir"));
+    let rustc = std::process::Command::new("rustc")
+        .args(rustc_args.args.iter().skip(1))
+        .envs(rustc_args.envs)
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .current_dir(std::env::current_dir().expect("Failed to get current dir"))
+        .status();
 
     // Propagate the exit code
-    std::process::exit(cmd.status().unwrap().code().unwrap())
+    std::process::exit(rustc.unwrap().code().unwrap())
 }

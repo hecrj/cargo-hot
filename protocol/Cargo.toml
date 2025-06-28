@@ -3,6 +3,9 @@ name = "cargo-hot-protocol"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [features]
 server = ["dep:tokio"]
 

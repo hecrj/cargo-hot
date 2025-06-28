@@ -128,7 +128,7 @@ impl Cache {
                             // treat undefined symbols as 0 to match macho/elf
                             let rva = rva.unwrap_or_default();
 
-                            symbol_table.insert(
+                            let _ = symbol_table.insert(
                                 data.name.to_string().to_string(),
                                 CachedSymbol {
                                     address: rva.0 as u64,
@@ -152,7 +152,7 @@ impl Cache {
                             // treat undefined symbols as 0 to match macho/elf
                             let rva = rva.unwrap_or_default();
 
-                            symbol_table.insert(
+                            let _ = symbol_table.insert(
                                 data.name.to_string().to_string(),
                                 CachedSymbol {
                                     address: rva.0 as u64,
@@ -317,7 +317,7 @@ fn create_windows_jump_table(patch: &Path, cache: &Cache) -> Result<JumpTable> {
         if let Ok(pdb::SymbolData::Public(data)) = symbol.parse() {
             let rva = data.offset.to_rva(&address_map);
             if let Some(rva) = rva {
-                new_name_to_addr.insert(data.name.to_string(), rva.0 as u64);
+                let _ = new_name_to_addr.insert(data.name.to_string(), rva.0 as u64);
             }
         }
     }
@@ -325,7 +325,7 @@ fn create_windows_jump_table(patch: &Path, cache: &Cache) -> Result<JumpTable> {
     let mut map = AddressMap::default();
     for (new_name, new_addr) in new_name_to_addr.iter() {
         if let Some(old_addr) = old_name_to_addr.get(new_name.as_ref()) {
-            map.insert(old_addr.address, *new_addr);
+            let _ = map.insert(old_addr.address, *new_addr);
         }
     }
 
@@ -372,7 +372,7 @@ fn create_native_jump_table(patch: &Path, triple: &Triple, cache: &Cache) -> Res
 
     for (new_name, new_addr) in new_name_to_addr.iter() {
         if let Some(old_addr) = old_name_to_addr.get(*new_name) {
-            map.insert(old_addr.address, *new_addr);
+            let _ = map.insert(old_addr.address, *new_addr);
         }
     }
 
@@ -616,7 +616,7 @@ fn create_wasm_jump_table(patch: &Path, cache: &Cache) -> Result<JumpTable> {
     for custom_id in customs {
         if let Some(custom) = new.customs.get_mut(custom_id) {
             if custom.name().contains("manganis") || custom.name().contains("__wasm_bindgen") {
-                new.customs.delete(custom_id);
+                let _ = new.customs.delete(custom_id);
             }
         }
     }
@@ -637,7 +637,7 @@ fn create_wasm_jump_table(patch: &Path, cache: &Cache) -> Result<JumpTable> {
     let mut map = AddressMap::default();
     for (name, idx) in name_to_ifunc_new.iter() {
         if let Some(old_idx) = name_to_ifunc_old.get(*name) {
-            map.insert(*old_idx as u64, *idx as u64);
+            let _ = map.insert(*old_idx as u64, *idx as u64);
         }
     }
 
@@ -674,16 +674,16 @@ fn convert_import_to_ifunc_call(
 
     // Push the params onto the stack
     for arg in locals.iter() {
-        body.local_get(*arg);
+        let _ = body.local_get(*arg);
     }
 
     // And then the address of the indirect function
-    body.instr(ir::Instr::Const(ir::Const {
+    let _ = body.instr(ir::Instr::Const(ir::Const {
         value: ir::Value::I32(table_idx),
     }));
 
     // And call it
-    body.instr(ir::Instr::CallIndirect(ir::CallIndirect {
+    let _ = body.instr(ir::Instr::CallIndirect(ir::CallIndirect {
         ty: ty_id,
         table: ifunc_table_initializer,
     }));
@@ -717,7 +717,7 @@ fn collect_func_ifuncs(m: &Module) -> HashMap<&str, i32> {
             ElementItems::Functions(ids) => {
                 for (idx, id) in ids.iter().enumerate() {
                     if let Some(name) = m.funcs.get(*id).name.as_deref() {
-                        func_to_offset.insert(name, offset + idx as i32);
+                        let _ = func_to_offset.insert(name, offset + idx as i32);
                     }
                 }
             }
@@ -756,9 +756,9 @@ pub fn create_undefined_symbol_stub(
         let file = File::parse(bytes.deref() as &[u8])?;
         for symbol in file.symbols() {
             if symbol.is_undefined() {
-                undefined_symbols.insert(symbol.name()?.to_string());
+                let _ = undefined_symbols.insert(symbol.name()?.to_string());
             } else if symbol.is_global() {
-                defined_symbols.insert(symbol.name()?.to_string());
+                let _ = defined_symbols.insert(symbol.name()?.to_string());
             }
         }
     }
@@ -888,7 +888,7 @@ pub fn create_undefined_symbol_stub(
                 );
 
                 // Add the symbol as a data symbol in our data section
-                obj.add_symbol(Symbol {
+                let _ = obj.add_symbol(Symbol {
                     name: name.as_bytes().to_vec(),
                     value: offset, // Offset within the data section
                     size: 8,       // Size of pointer
@@ -1017,7 +1017,7 @@ pub fn create_undefined_symbol_stub(
                     },
                 };
                 let offset = obj.append_section_data(text_section, &jump_asm, 8);
-                obj.add_symbol(Symbol {
+                let _ = obj.add_symbol(Symbol {
                     name: name.as_bytes()[name_offset..].to_vec(),
                     value: offset,
                     size: jump_asm.len() as u64,
@@ -1086,7 +1086,7 @@ pub fn create_undefined_symbol_stub(
 
                 let offset = obj.append_section_data(tls_section, &init, align);
 
-                obj.add_symbol(Symbol {
+                let _ = obj.add_symbol(Symbol {
                     name: name.as_bytes()[name_offset..].to_vec(),
                     value: offset, // offset inside .tdata
                     size,
@@ -1114,7 +1114,7 @@ pub fn create_undefined_symbol_stub(
                     _ => sym.flags,
                 };
 
-                obj.add_symbol(Symbol {
+                let _ = obj.add_symbol(Symbol {
                     name: name.as_bytes()[name_offset..].to_vec(),
                     value: abs_addr,
                     size: 0,
@@ -1196,14 +1196,14 @@ pub fn prepare_wasm_base_module(bytes: &[u8]) -> Result<Vec<u8>> {
                 .collect::<Vec<_>>();
 
             for l in locals.iter() {
-                body.local_get(*l);
+                let _ = body.local_get(*l);
             }
 
-            body.call(imported_func);
+            let _ = body.call(imported_func);
 
             let new_func_id = module.funcs.add_local(builder.local_func(locals));
 
-            module
+            let _ = module
                 .exports
                 .add(&format!("__saved_wbg_{}", import.name), new_func_id);
 
@@ -1230,7 +1230,7 @@ pub fn prepare_wasm_base_module(bytes: &[u8]) -> Result<Vec<u8>> {
         //
         // https://github.com/rustwasm/wasm-bindgen/blob/c35cc9369d5e0dc418986f7811a0dd702fb33ef9/crates/cli-support/src/wit/mod.rs#L1505
         if name.starts_with("__wbindgen") {
-            module
+            let _ = module
                 .exports
                 .add(&format!("__saved_wbg_{name}"), func.id());
         }
@@ -1305,7 +1305,7 @@ fn name_is_bindgen_symbol(name: &str) -> bool {
 /// We need to do this for data symbols because walrus doesn't provide the right range and offset
 /// information for data segments. Fortunately, it provides it for code sections, so we only need to
 /// do a small amount extra of parsing here.
-fn parse_bytes_to_data_segment(bytes: &[u8]) -> Result<RawDataSection> {
+fn parse_bytes_to_data_segment(bytes: &[u8]) -> Result<RawDataSection<'_>> {
     let parser = wasmparser::Parser::new(0);
     let mut parser = parser.parse_all(bytes);
     let mut segments = vec![];
@@ -1344,7 +1344,7 @@ fn parse_bytes_to_data_segment(bytes: &[u8]) -> Result<RawDataSection> {
     for (index, symbol) in symbols.iter().enumerate() {
         if let SymbolInfo::Func { name, index, .. } = symbol {
             if let Some(name) = name {
-                code_symbol_map.insert(*name, *index as usize);
+                let _ = code_symbol_map.insert(*name, *index as usize);
             }
             continue;
         }
@@ -1358,7 +1358,7 @@ fn parse_bytes_to_data_segment(bytes: &[u8]) -> Result<RawDataSection> {
             continue;
         };
 
-        data_symbol_map.insert(*name, index);
+        let _ = data_symbol_map.insert(*name, index);
 
         if symbol.size == 0 {
             continue;
@@ -1371,7 +1371,7 @@ fn parse_bytes_to_data_segment(bytes: &[u8]) -> Result<RawDataSection> {
             data_segment.range.end - data_segment.data.len() + (symbol.offset as usize);
         let range = offset..(offset + symbol.size as usize);
 
-        data_symbols.insert(
+        let _ = data_symbols.insert(
             index,
             DataSymbol {
                 _index: index,
@@ -1417,7 +1417,7 @@ struct ParsedModule<'a> {
 
 /// Parse a module and return the mapping of index to FunctionID.
 /// We'll use this mapping to remap ModuleIDs
-fn parse_module_with_ids(bindgened: &[u8]) -> Result<ParsedModule> {
+fn parse_module_with_ids(bindgened: &[u8]) -> Result<ParsedModule<'_>> {
     let ids = Arc::new(RwLock::new(Vec::new()));
     let ids_ = ids.clone();
     let module = Module::from_buffer_with_config(

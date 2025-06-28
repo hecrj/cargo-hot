@@ -5,6 +5,9 @@ edition = "2024"
 description = "Coming soon!"
 license = "MIT"
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow.workspace = true
 ar.workspace = true
@@ -82,3 +85,8 @@ uuid = "1.17"
 walrus = "0.23"
 wasmparser = "0.232"
 which = "7"
+
+[workspace.lints.rust]
+rust_2018_idioms = { level = "deny", priority = -1 }
+unsafe_code = "deny"
+unused_results = "deny"

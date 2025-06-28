@@ -25,7 +25,7 @@ impl Server {
         client.readable().await?;
 
         let mut buffer = [0; std::mem::size_of::<usize>()];
-        client.read_exact(&mut buffer).await?;
+        let _ = client.read_exact(&mut buffer).await?;
 
         Ok(Connection {
             socket: client,

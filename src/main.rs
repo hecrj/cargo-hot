@@ -301,7 +301,7 @@ impl Server {
             self.link_err_file(),
             self.rustc_wrapper_args_file(),
         ] {
-            std::fs::OpenOptions::new()
+            let _ = std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(false)
@@ -468,7 +468,7 @@ impl Server {
 
     async fn write_executable(&self, exe: &Path) -> Result<()> {
         // TODO: Wasm
-        std::fs::copy(exe, self.main_exe())?;
+        let _ = std::fs::copy(exe, self.main_exe())?;
 
         Ok(())
     }
@@ -1286,13 +1286,13 @@ impl Server {
             .iter()
             .position(|arg| *arg == "-o" || *arg == "--output")
         {
-            args.remove(idx + 1);
-            args.remove(idx);
+            let _ = args.remove(idx + 1);
+            let _ = args.remove(idx);
         }
 
         // same but windows support
         if let Some(idx) = args.iter().position(|arg| arg.starts_with("/OUT")) {
-            args.remove(idx);
+            let _ = args.remove(idx);
         }
 
         // TODO
@@ -1502,14 +1502,16 @@ impl Server {
             // todo: maybe rustc needs to be found on the FS instead of using the one in the path?
             BuildMode::Thin { rustc_args, .. } => {
                 let mut cmd = tokio::process::Command::new("rustc");
-                cmd.current_dir(&self.workspace_dir);
-                cmd.env_clear();
-                cmd.args(rustc_args.args[1..].iter());
-                cmd.env_remove("RUSTC_WORKSPACE_WRAPPER");
-                cmd.env_remove("RUSTC_WRAPPER");
-                cmd.env_remove(rustc::DX_RUSTC_WRAPPER_ENV_VAR);
-                cmd.envs(self.cargo_build_env_vars(mode)?);
-                cmd.arg(format!("-Clinker={}", path_to_me()?.display()));
+
+                let _ = cmd
+                    .current_dir(&self.workspace_dir)
+                    .env_clear()
+                    .args(rustc_args.args[1..].iter())
+                    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                    .env_remove("RUSTC_WRAPPER")
+                    .env_remove(rustc::DX_RUSTC_WRAPPER_ENV_VAR)
+                    .envs(self.cargo_build_env_vars(mode)?)
+                    .arg(format!("-Clinker={}", path_to_me()?.display()));
 
                 // TODO
                 // if self.platform == Platform::Web {
@@ -1518,7 +1520,7 @@ impl Server {
 
                 log::debug!("Direct rustc: {cmd:#?}");
 
-                cmd.envs(rustc_args.envs.iter().cloned());
+                let _ = cmd.envs(rustc_args.envs.iter().cloned());
 
                 // tracing::trace!("Setting env vars: {:#?}", rustc_args.envs);
 
@@ -1538,7 +1540,8 @@ impl Server {
             _ => {
                 let mut cmd = tokio::process::Command::new("cargo");
 
-                cmd.arg("rustc")
+                let _ = cmd
+                    .arg("rustc")
                     .current_dir(&self.crate_dir)
                     .arg("--message-format")
                     .arg("json-diagnostic-rendered-ansi")
@@ -1548,14 +1551,15 @@ impl Server {
                     .envs(self.cargo_build_env_vars(mode)?);
 
                 if mode == &BuildMode::Fat {
-                    cmd.env(
-                        rustc::DX_RUSTC_WRAPPER_ENV_VAR,
-                        dunce::canonicalize(self.rustc_wrapper_args_file())
-                            .unwrap()
-                            .display()
-                            .to_string(),
-                    );
-                    cmd.env("RUSTC_WRAPPER", path_to_me()?.display().to_string());
+                    let _ = cmd
+                        .env(
+                            rustc::DX_RUSTC_WRAPPER_ENV_VAR,
+                            dunce::canonicalize(self.rustc_wrapper_args_file())
+                                .unwrap()
+                                .display()
+                                .to_string(),
+                        )
+                        .env("RUSTC_WRAPPER", path_to_me()?.display().to_string());
                 }
 
                 log::debug!("Cargo: {cmd:#?}");

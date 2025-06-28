@@ -20,7 +20,7 @@ pub fn connect() {
         let aslr_reference = subsecond::aslr_reference();
 
         // TODO: Wasm support
-        thread::spawn(move || {
+        let _ = thread::spawn(move || {
             loop {
                 if let Err(error) = run(aslr_reference) {
                     log::trace!("connection lost: {error}");
@@ -59,6 +59,7 @@ fn run(aslr_reference: usize) -> Result<()> {
 
         let entries = patch.map.len();
 
+        #[allow(unsafe_code)]
         unsafe {
             subsecond::apply_patch(patch)?;
         }
