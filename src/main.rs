@@ -45,7 +45,7 @@ async fn main() -> Result<ExitCode> {
         .subcommand()
         .ok_or(anyhow!("`cargo-hot` must be called with `hot` subcommand"))?;
 
-    let server = Server::new(gctx, &args).await?;
+    let server = Server::new(gctx, args).await?;
 
     server.run().await
 }
@@ -208,10 +208,10 @@ impl Server {
 
                 if let Some(example) = &args.get_one::<String>("example"){
                     let examples = target_of_kind(&TargetKind::ExampleBin);
-                    format!("Failed to find example {example}. \nAvailable examples are:\n{}", examples)
+                    format!("Failed to find example {example}. \nAvailable examples are:\n{examples}")
                 } else if let Some(bin) = &args.get_one::<String>("bin") {
                     let binaries = target_of_kind(&TargetKind::Bin);
-                    format!("Failed to find binary {bin}. \nAvailable binaries are:\n{}", binaries)
+                    format!("Failed to find binary {bin}. \nAvailable binaries are:\n{binaries}")
                 } else {
                     format!("Failed to find target {target_name}. \nIt looks like you are trying to build a library crate. \
                     You either need to run `cargo hot` from inside a binary crate or build a specific example with the `--example` flag. \
@@ -295,18 +295,18 @@ impl Server {
         use notify::Watcher;
 
         std::fs::create_dir_all(self.exe_dir())?;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .open(self.link_args_file())?;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .open(self.link_err_file())?;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .open(self.rustc_wrapper_args_file())?;
+
+        for file in [
+            self.link_args_file(),
+            self.link_err_file(),
+            self.rustc_wrapper_args_file(),
+        ] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(file)?;
+        }
 
         let (sender, mut receiver) = mpsc::channel(1);
 
@@ -354,9 +354,7 @@ impl Server {
                         return None;
                     };
 
-                    let Some(path) = event.paths.first() else {
-                        return None;
-                    };
+                    let path = event.paths.first()?;
 
                     if path != &path.with_extension("rs") {
                         return None;
@@ -550,7 +548,7 @@ impl Server {
                     // Handle direct rustc diagnostics
                     if let Ok(diag) = serde_json::from_str::<Diagnostic>(&line) {
                         if let Some(rendered) = diag.rendered {
-                            println!("{}", rendered);
+                            println!("{rendered}");
                         }
 
                         continue;
@@ -587,8 +585,7 @@ impl Server {
                     if !finished.success {
                         return Err(anyhow::anyhow!(
                             "Cargo build failed, signaled by the compiler. Toggle tracing mode (press `t`) for more information."
-                        )
-                        .into());
+                        ));
                     }
                 }
                 _ => {}
@@ -607,9 +604,9 @@ impl Server {
         if let Ok(linker_warnings) = std::fs::read_to_string(self.link_err_file()) {
             if !linker_warnings.is_empty() {
                 if output_location.is_none() {
-                    log::error!("Linker warnings: {}", linker_warnings);
+                    log::error!("Linker warnings: {linker_warnings}");
                 } else {
-                    log::debug!("Linker warnings: {}", linker_warnings);
+                    log::debug!("Linker warnings: {linker_warnings}");
                 }
             }
         }
@@ -778,7 +775,7 @@ impl Server {
             _ => vec!["-o".to_string(), out_exe.display().to_string()],
         };
 
-        log::trace!("Linking with {:?} using args: {:#?}", linker, object_files);
+        log::trace!("Linking with {linker:?} using args: {object_files:#?}");
 
         // Run the linker directly!
         //
@@ -987,7 +984,7 @@ impl Server {
             }
 
             LinkerFlavor::Unsupported => {
-                return Err(anyhow::anyhow!("Unsupported platform for thin linking").into());
+                return Err(anyhow::anyhow!("Unsupported platform for thin linking"));
             }
         }
 
@@ -1016,7 +1013,7 @@ impl Server {
     }
 
     fn executable_name(&self) -> &str {
-        &self.crate_target.name()
+        self.crate_target.name()
     }
 
     fn platform_exe_name(&self) -> String {
@@ -1153,11 +1150,11 @@ impl Server {
                 // if the rlib is not in the target directory, we skip it.
                 if !rlib.starts_with(&self.workspace_dir) {
                     compiler_rlibs.push(rlib.clone());
-                    log::trace!("Skipping rlib: {:?}", rlib);
+                    log::trace!("Skipping rlib: {rlib:?}");
                     continue;
                 }
 
-                log::trace!("Adding rlib to staticlib: {:?}", rlib);
+                log::trace!("Adding rlib to staticlib: {rlib:?}");
 
                 let rlib_contents = std::fs::read(rlib)?;
                 let mut reader = ar::Archive::new(std::io::Cursor::new(rlib_contents));
@@ -1182,7 +1179,7 @@ impl Server {
                     }
 
                     if !(name.ends_with(".o") || name.ends_with(".obj")) {
-                        log::debug!("Unknown object file in rlib: {:?}", name);
+                        log::debug!("Unknown object file in rlib: {name:?}");
                     }
 
                     archive_has_contents = true;
@@ -1194,7 +1191,7 @@ impl Server {
 
             let bytes = out_ar.into_inner().context("Failed to finalize archive")?;
             std::fs::write(&out_ar_path, bytes).context("Failed to write archive")?;
-            log::debug!("Wrote fat archive to {:?}", out_ar_path);
+            log::debug!("Wrote fat archive to {out_ar_path:?}");
 
             // Run the ranlib command to index the archive. This slows down this process a bit,
             // but is necessary for some linkers to work properly.
@@ -1309,7 +1306,7 @@ impl Server {
         // And now we can run the linker with our new args
         let linker = self.select_linker()?;
 
-        log::trace!("Fat linking with args: {:?} {:#?}", linker, args);
+        log::trace!("Fat linking with args: {linker:?} {args:#?}");
         log::trace!("Fat linking with env: {:#?}", rustc_args.envs);
 
         // Run the linker directly!
@@ -1519,7 +1516,7 @@ impl Server {
                 //     cmd.arg("-Crelocation-model=pic");
                 // }
 
-                log::debug!("Direct rustc: {:#?}", cmd);
+                log::debug!("Direct rustc: {cmd:#?}");
 
                 cmd.envs(rustc_args.envs.iter().cloned());
 
@@ -1561,7 +1558,7 @@ impl Server {
                     cmd.env("RUSTC_WRAPPER", path_to_me()?.display().to_string());
                 }
 
-                log::debug!("Cargo: {:#?}", cmd);
+                log::debug!("Cargo: {cmd:#?}");
 
                 Ok(cmd)
             }
@@ -1794,10 +1791,8 @@ fn select_ranlib() -> Option<PathBuf> {
 }
 
 fn path_to_me() -> Result<PathBuf> {
-    Ok(
-        dunce::canonicalize(std::env::current_exe().context("Failed to find cargo-hot")?)
-            .context("Failed to find cargo-hot")?,
-    )
+    dunce::canonicalize(std::env::current_exe().context("Failed to find cargo-hot")?)
+        .context("Failed to find cargo-hot")
 }
 
 async fn read_batch<T>(
@@ -1824,5 +1819,5 @@ async fn read_batch<T>(
         n += 1;
     }
 
-    return n;
+    n
 }

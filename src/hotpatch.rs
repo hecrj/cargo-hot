@@ -752,7 +752,7 @@ pub fn create_undefined_symbol_stub(
     let mut defined_symbols = HashSet::new();
 
     for path in sorted {
-        let bytes = std::fs::read(path).with_context(|| format!("failed to read {:?}", path))?;
+        let bytes = std::fs::read(path).with_context(|| format!("failed to read {path:?}"))?;
         let file = File::parse(bytes.deref() as &[u8])?;
         for symbol in file.symbols() {
             if symbol.is_undefined() {
@@ -767,7 +767,7 @@ pub fn create_undefined_symbol_stub(
         .cloned()
         .collect();
 
-    log::trace!("Undefined symbols: {:#?}", undefined_symbols);
+    log::trace!("Undefined symbols: {undefined_symbols:#?}");
 
     // Create a new object file (architecture doesn't matter much for our purposes)
     let mut obj = object::write::Object::new(
@@ -829,8 +829,7 @@ pub fn create_undefined_symbol_stub(
 
     if aslr_reference < aslr_ref_address {
         return Err(PatchError::InvalidModule(format!(
-            "ASLR reference is less than the main module's address - is there a `main`?. {:x} < {:x}",
-            aslr_reference, aslr_ref_address
+            "ASLR reference is less than the main module's address - is there a `main`?. {aslr_reference:x} < {aslr_ref_address:x}"
         )));
     }
 
@@ -844,7 +843,7 @@ pub fn create_undefined_symbol_stub(
             .symbol_table
             .get(name.as_str().trim_start_matches("__imp_"))
         else {
-            log::debug!("Symbol not found: {}", name);
+            log::debug!("Symbol not found: {name}");
             continue;
         };
 

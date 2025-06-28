@@ -11,19 +11,19 @@ use target_lexicon::Triple;
 /// This comes in two flavors:
 /// --------------------------
 /// - `BaseLink`: We are linking dependencies and want to dynamically select the linker from the environment.
-///               This is mostly implemented for Android where the linker is selected in part by the
-///               device connected over ADB which can not be determined by .cargo/Config.toml.
-///               We implemented this because previous setups like cargo mobile required a hard-coded
-///               linker path in your project which does not work in team-based setups.
+///   This is mostly implemented for Android where the linker is selected in part by the
+///   device connected over ADB which can not be determined by .cargo/Config.toml.
+///   We implemented this because previous setups like cargo mobile required a hard-coded
+///   linker path in your project which does not work in team-based setups.
 ///
 /// - `NoLink`: We are not linking at all, and instead deferring our linking to the driving process,
-///             usually being `dx` itself. In this case, we are just writing the linker args to a file
-///             and then outputting a dummy object file to satisfy the linker. This is generally used
-///             by the binary patching engine since we need to actually do "real linker logic" like
-///             traversing object files and satisfying missing symbols. That process is *much* easier
-///             to do in the driving host process when we have all the information available. Unfortunately,
-///             rustc doesn't provide a "real" way of granularly stepping through the compile process
-///             so this is basically a hack.
+///   usually being `dx` itself. In this case, we are just writing the linker args to a file
+///   and then outputting a dummy object file to satisfy the linker. This is generally used
+///   by the binary patching engine since we need to actually do "real linker logic" like
+///   traversing object files and satisfying missing symbols. That process is *much* easier
+///   to do in the driving host process when we have all the information available. Unfortunately,
+///   rustc doesn't provide a "real" way of granularly stepping through the compile process
+///   so this is basically a hack.
 ///
 /// We use "BaseLink" when a linker is specified, and "NoLink" when it is not. Both generate a resulting
 /// object file.
@@ -254,8 +254,8 @@ pub fn handle_linker_command_file(args: &mut Vec<String>) {
             .map(|line| {
                 let line_parsed = line.trim().to_string();
                 let line_parsed = line_parsed.trim_end_matches('"').to_string();
-                let line_parsed = line_parsed.trim_start_matches('"').to_string();
-                line_parsed
+
+                line_parsed.trim_start_matches('"').to_string()
             })
             .collect();
     }

@@ -40,7 +40,7 @@ impl Connection {
     }
 
     pub async fn patch(&mut self, patch: &JumpTable) -> Result<()> {
-        let bytes = bincode::serde::encode_to_vec(&patch, bincode::config::standard())?;
+        let bytes = bincode::serde::encode_to_vec(patch, bincode::config::standard())?;
 
         self.socket.writable().await?;
         self.socket.write_all(&bytes.len().to_be_bytes()).await?;
