@@ -64,7 +64,7 @@ license = "MIT"
 repository = "https://github.com/hecrj/cargo-hot"
 
 [workspace.dependencies]
-cargo-hot-protocol = { path = "./protocol" }
+cargo-hot-protocol = { version = "0.1", path = "./protocol" }
 
 anyhow = "1"
 ar = "0.9"
