@@ -614,10 +614,10 @@ fn create_wasm_jump_table(patch: &Path, cache: &Cache) -> Result<JumpTable> {
     // Wipe away the unnecessary sections
     let customs = new.customs.iter().map(|f| f.0).collect::<Vec<_>>();
     for custom_id in customs {
-        if let Some(custom) = new.customs.get_mut(custom_id) {
-            if custom.name().contains("manganis") || custom.name().contains("__wasm_bindgen") {
-                let _ = new.customs.delete(custom_id);
-            }
+        if let Some(custom) = new.customs.get_mut(custom_id)
+            && (custom.name().contains("manganis") || custom.name().contains("__wasm_bindgen"))
+        {
+            let _ = new.customs.delete(custom_id);
         }
     }
 
@@ -1247,10 +1247,10 @@ pub fn prepare_wasm_base_module(bytes: &[u8]) -> Result<Vec<u8>> {
         // around issues on large projects where we hit the maximum number of exports.
         //
         // https://github.com/emscripten-core/emscripten/issues/22863
-        if let FunctionKind::Local(_) = &func.kind {
-            if !ifuncs.contains(&func.id()) {
-                make_indirect.push(func.id());
-            }
+        if let FunctionKind::Local(_) = &func.kind
+            && !ifuncs.contains(&func.id())
+        {
+            make_indirect.push(func.id());
         }
     }
 

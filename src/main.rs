@@ -594,20 +594,20 @@ impl Server {
 
         // Accumulate the rustc args from the wrapper, if they exist and can be parsed.
         let mut direct_rustc = rustc::Args::default();
-        if let Ok(res) = std::fs::read_to_string(self.rustc_wrapper_args_file()) {
-            if let Ok(res) = serde_json::from_str(&res) {
-                direct_rustc = res;
-            }
+        if let Ok(res) = std::fs::read_to_string(self.rustc_wrapper_args_file())
+            && let Ok(res) = serde_json::from_str(&res)
+        {
+            direct_rustc = res;
         }
 
         // If there's any warnings from the linker, we should print them out
-        if let Ok(linker_warnings) = std::fs::read_to_string(self.link_err_file()) {
-            if !linker_warnings.is_empty() {
-                if output_location.is_none() {
-                    log::error!("Linker warnings: {linker_warnings}");
-                } else {
-                    log::debug!("Linker warnings: {linker_warnings}");
-                }
+        if let Ok(linker_warnings) = std::fs::read_to_string(self.link_err_file())
+            && !linker_warnings.is_empty()
+        {
+            if output_location.is_none() {
+                log::error!("Linker warnings: {linker_warnings}");
+            } else {
+                log::debug!("Linker warnings: {linker_warnings}");
             }
         }
 
@@ -1196,13 +1196,13 @@ impl Server {
             // Run the ranlib command to index the archive. This slows down this process a bit,
             // but is necessary for some linkers to work properly.
             // We ignore its error in case it doesn't recognize the architecture
-            if self.linker_flavor() == LinkerFlavor::Darwin {
-                if let Some(ranlib) = select_ranlib() {
-                    _ = tokio::process::Command::new(ranlib)
-                        .arg(&out_ar_path)
-                        .output()
-                        .await;
-                }
+            if self.linker_flavor() == LinkerFlavor::Darwin
+                && let Some(ranlib) = select_ranlib()
+            {
+                _ = tokio::process::Command::new(ranlib)
+                    .arg(&out_ar_path)
+                    .output()
+                    .await;
             }
         }
 
@@ -1214,50 +1214,50 @@ impl Server {
         // We also need to insert the -force_load flag to force the linker to load the archive
         let mut args = rustc_args.link_args.clone();
 
-        if let Some(last_object) = args.iter().rposition(|arg| arg.ends_with(".o")) {
-            if archive_has_contents {
-                match self.linker_flavor() {
-                    LinkerFlavor::WasmLld => {
-                        args.insert(last_object, "--whole-archive".to_string());
-                        args.insert(last_object + 1, out_ar_path.display().to_string());
-                        args.insert(last_object + 2, "--no-whole-archive".to_string());
-                        args.retain(|arg| !arg.ends_with(".rlib"));
-                        for rlib in compiler_rlibs.iter().rev() {
-                            args.insert(last_object + 3, rlib.display().to_string());
-                        }
+        if let Some(last_object) = args.iter().rposition(|arg| arg.ends_with(".o"))
+            && archive_has_contents
+        {
+            match self.linker_flavor() {
+                LinkerFlavor::WasmLld => {
+                    args.insert(last_object, "--whole-archive".to_string());
+                    args.insert(last_object + 1, out_ar_path.display().to_string());
+                    args.insert(last_object + 2, "--no-whole-archive".to_string());
+                    args.retain(|arg| !arg.ends_with(".rlib"));
+                    for rlib in compiler_rlibs.iter().rev() {
+                        args.insert(last_object + 3, rlib.display().to_string());
                     }
-                    LinkerFlavor::Gnu => {
-                        args.insert(last_object, "-Wl,--whole-archive".to_string());
-                        args.insert(last_object + 1, out_ar_path.display().to_string());
-                        args.insert(last_object + 2, "-Wl,--no-whole-archive".to_string());
-                        args.retain(|arg| !arg.ends_with(".rlib"));
-                        for rlib in compiler_rlibs.iter().rev() {
-                            args.insert(last_object + 3, rlib.display().to_string());
-                        }
+                }
+                LinkerFlavor::Gnu => {
+                    args.insert(last_object, "-Wl,--whole-archive".to_string());
+                    args.insert(last_object + 1, out_ar_path.display().to_string());
+                    args.insert(last_object + 2, "-Wl,--no-whole-archive".to_string());
+                    args.retain(|arg| !arg.ends_with(".rlib"));
+                    for rlib in compiler_rlibs.iter().rev() {
+                        args.insert(last_object + 3, rlib.display().to_string());
                     }
-                    LinkerFlavor::Darwin => {
-                        args.insert(last_object, "-Wl,-force_load".to_string());
-                        args.insert(last_object + 1, out_ar_path.display().to_string());
-                        args.retain(|arg| !arg.ends_with(".rlib"));
-                        for rlib in compiler_rlibs.iter().rev() {
-                            args.insert(last_object + 2, rlib.display().to_string());
-                        }
+                }
+                LinkerFlavor::Darwin => {
+                    args.insert(last_object, "-Wl,-force_load".to_string());
+                    args.insert(last_object + 1, out_ar_path.display().to_string());
+                    args.retain(|arg| !arg.ends_with(".rlib"));
+                    for rlib in compiler_rlibs.iter().rev() {
+                        args.insert(last_object + 2, rlib.display().to_string());
                     }
-                    LinkerFlavor::Msvc => {
-                        args.insert(
-                            last_object,
-                            format!("/WHOLEARCHIVE:{}", out_ar_path.display()),
-                        );
-                        args.retain(|arg| !arg.ends_with(".rlib"));
-                        for rlib in compiler_rlibs.iter().rev() {
-                            args.insert(last_object + 1, rlib.display().to_string());
-                        }
+                }
+                LinkerFlavor::Msvc => {
+                    args.insert(
+                        last_object,
+                        format!("/WHOLEARCHIVE:{}", out_ar_path.display()),
+                    );
+                    args.retain(|arg| !arg.ends_with(".rlib"));
+                    for rlib in compiler_rlibs.iter().rev() {
+                        args.insert(last_object + 1, rlib.display().to_string());
                     }
-                    LinkerFlavor::Unsupported => {
-                        log::error!("Unsupported platform for fat linking");
-                    }
-                };
-            }
+                }
+                LinkerFlavor::Unsupported => {
+                    log::error!("Unsupported platform for fat linking");
+                }
+            };
         }
 
         // Add custom args to the linkers
@@ -1413,10 +1413,9 @@ impl Server {
         if matches!(
             self.triple.operating_system,
             OperatingSystem::Darwin(_) | OperatingSystem::Linux | OperatingSystem::Windows
-        ) {
-            if let Ok(linker) = std::env::var("DX_HOST_LINKER") {
-                return Ok(PathBuf::from(linker));
-            }
+        ) && let Ok(linker) = std::env::var("DX_HOST_LINKER")
+        {
+            return Ok(PathBuf::from(linker));
         }
 
         if let Ok(linker) = std::env::var("DX_LINKER") {
