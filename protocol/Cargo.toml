@@ -1,7 +1,11 @@
 [package]
 name = "cargo-hot-protocol"
-version = "0.1.0"
-edition = "2024"
+description = "Protocol for cargo-hot integration"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lints]
 workspace = true

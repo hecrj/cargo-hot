@@ -1,9 +1,11 @@
 [package]
 name = "cargo-hot"
-version = "0.1.0"
-edition = "2024"
-description = "Coming soon!"
-license = "MIT"
+description = "cargo run but with hot reloading, powered by subsecond"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lints]
 workspace = true
@@ -53,6 +55,13 @@ walrus.features = ["parallel"]
 
 [workspace]
 members = ["example", "protocol"]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Héctor Ramón Jiménez <hector@hecrj.dev>"]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/hecrj/cargo-hot"
 
 [workspace.dependencies]
 cargo-hot-protocol = { path = "./protocol" }
