@@ -300,6 +300,7 @@ impl Server {
             self.link_args_file(),
             self.link_err_file(),
             self.rustc_wrapper_args_file(),
+            self.windows_command_file(),
         ] {
             let _ = std::fs::OpenOptions::new()
                 .write(true)
@@ -777,15 +778,28 @@ impl Server {
 
         log::trace!("Linking with {linker:?} using args: {object_files:#?}");
 
+        let mut out_args: Vec<OsString> = vec![];
+        out_args.extend(object_files.iter().map(Into::into));
+        out_args.extend(dylibs.iter().map(Into::into));
+        out_args.extend(self.thin_link_args(&args)?.iter().map(Into::into));
+        out_args.extend(out_arg.iter().map(Into::into));
+
+        if cfg!(windows) {
+            let cmd_contents: String = out_args
+                .iter()
+                .map(|s| format!("\"{}\"", s.to_string_lossy()))
+                .join(" ");
+            std::fs::write(self.windows_command_file(), cmd_contents)
+                .context("Failed to write linker command file")?;
+            out_args = vec![format!("@{}", self.windows_command_file().display()).into()];
+        }
+
         // Run the linker directly!
         //
         // We dump its output directly into the patch exe location which is different than how rustc
         // does it since it uses llvm-objcopy into the `target/debug/` folder.
         let res = tokio::process::Command::new(linker)
-            .args(object_files.iter())
-            .args(dylibs.iter())
-            .args(self.thin_link_args(&args)?)
-            .args(out_arg)
+            .args(out_args)
             .env_clear()
             .envs(rustc_args.envs.iter().map(|(k, v)| (k, v)))
             .output()
@@ -1303,21 +1317,33 @@ impl Server {
         //     args.remove(flavor_idx);
         // }
 
+        // Set the output file
+        match self.triple.operating_system {
+            OperatingSystem::Windows => args.push(format!("/OUT:{}", exe.display())),
+            _ => args.extend(["-o".to_string(), exe.display().to_string()]),
+        }
+
         // And now we can run the linker with our new args
         let linker = self.select_linker()?;
 
-        log::trace!("Fat linking with args: {linker:?} {args:#?}");
-        log::trace!("Fat linking with env: {:#?}", rustc_args.envs);
+        log::trace!("Fat linking with args: {:?} {:#?}", linker, args);
+        log::trace!("Fat linking with env:");
+        for e in rustc_args.envs.iter() {
+            log::trace!("  {}={}", e.0, e.1);
+        }
+
+        // Handle windows command files
+        let mut out_args = args.clone();
+        if cfg!(windows) {
+            let cmd_contents: String = out_args.iter().skip(1).map(|f| format!("\"{f}\"")).join(" ");
+            std::fs::write(self.windows_command_file(), cmd_contents)
+                .context("Failed to write linker command file")?;
+            out_args = vec![format!("@{}", self.windows_command_file().display())];
+        }
 
         // Run the linker directly!
-        let out_arg = match self.triple.operating_system {
-            OperatingSystem::Windows => vec![format!("/OUT:{}", exe.display())],
-            _ => vec!["-o".to_string(), exe.display().to_string()],
-        };
-
         let res = tokio::process::Command::new(linker)
-            .args(args.iter().skip(1))
-            .args(out_arg)
+            .args(out_args)
             .env_clear()
             .envs(rustc_args.envs.iter().map(|(k, v)| (k, v)))
             .output()
@@ -1783,6 +1809,10 @@ impl Server {
 
     fn rustc_wrapper_args_file(&self) -> PathBuf {
         self.exe_dir().join("rustc_wrapper_args.txt")
+    }
+
+    fn windows_command_file(&self) -> PathBuf {
+        self.exe_dir().join("windows_command.txt")
     }
 }
 
