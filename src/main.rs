@@ -139,7 +139,7 @@ impl Server {
             .args(["--print", "sysroot"])
             .output()
             .await
-            .map(|out| String::from_utf8(out.stdout))?
+            .map(|out| String::from_utf8(out.stdout).map(|s| s.trim().to_string()))?
             .context("Failed to extract rustc sysroot output")?;
 
         let target_kind = if args.contains_id("example") {
@@ -428,7 +428,7 @@ impl Server {
 
         // Populate the patch cache if we're in fat mode
         if matches!(mode, BuildMode::Fat) {
-            build.patch_cache = Some(Arc::new(self.create_patch_cache().await?));
+            build.patch_cache = Some(Arc::new(self.create_patch_cache(&build.exe).await?));
         }
 
         Ok(build)
@@ -460,9 +460,9 @@ impl Server {
         Ok(())
     }
 
-    async fn create_patch_cache(&self) -> Result<hotpatch::Cache> {
+    async fn create_patch_cache(&self, exe: &Path) -> Result<hotpatch::Cache> {
         // TODO: Wasm
-        let exe = self.main_exe().to_path_buf();
+        let exe = exe.to_path_buf();
 
         Ok(hotpatch::Cache::new(&exe, &self.triple)?)
     }
