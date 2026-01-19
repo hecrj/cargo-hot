@@ -247,7 +247,19 @@ impl Server {
             .map(Filesystem::new)
             .unwrap_or_else(|| workspace.target_dir());
 
-        let custom_linker = cargo_config.linker(triple.to_string())?;
+        let mut custom_linker = cargo_config.linker(triple.to_string())?;
+        if let Some(linker) = custom_linker.as_ref()
+            && (linker == "rust-lld" || linker == "rust-lld.exe")
+            && cfg!(windows)
+        {
+            // When using "rust-lld.exe" as linker on windows, it still needs to have a flavor
+            // given to it. rustc appears to be passing `-flavor "link"` when none is set by the
+            // user. If no flavor is given, it fails with 'lld is a generic driver'.
+            // We already use the existing lld-link by default on windows, so we can simply set the
+            // `custom_linker` to `None` in these cases, since we end up using "lld-link" anyway
+            // which is the same as "rust-lld.exe -flavor link".
+            custom_linker = None;
+        }
 
         let exe_args = args
             .get_many("args")
