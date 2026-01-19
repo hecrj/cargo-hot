@@ -28,16 +28,46 @@ pub struct Args {
     pub link_args: Vec<String>,
 }
 
+/// Check if the arguments indicate a linking step, including those in command files.
+fn has_linking_args() -> bool {
+    for arg in std::env::args() {
+        // Direct check for linker-like arguments
+        if arg.ends_with(".o") || arg == "-flavor" {
+            return true;
+        }
+
+        // Check inside command files
+        if let Some(path_str) = arg.strip_prefix('@')
+            && let Ok(file_binary) = std::fs::read(path_str)
+        {
+            // Handle both UTF-8 and UTF-16LE encodings for response files.
+            let content = String::from_utf8(file_binary.clone()).unwrap_or_else(|_| {
+                let binary_u16le: Vec<u16> = file_binary
+                    .chunks_exact(2)
+                    .map(|a| u16::from_le_bytes([a[0], a[1]]))
+                    .collect();
+                String::from_utf16_lossy(&binary_u16le)
+            });
+
+            // Check if any line in the command file contains linking indicators.
+            if content.lines().any(|line| {
+                let trimmed_line = line.trim().trim_matches('"');
+                trimmed_line.ends_with(".o") || trimmed_line == "-flavor"
+            }) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// Run rustc directly, but output the result to a file.
 ///
 /// <https://doc.rust-lang.org/cargo/reference/config.html#buildrustc>
 pub async fn run_rustc() {
-    // if we happen to be both a rustc wrapper and a linker, we want to run the linker if the arguments seem linker-y
-    // this is a stupid hack
-    if std::env::args()
-        .take(5)
-        .any(|arg| arg.ends_with(".o") || arg == "-flavor" || arg.starts_with("@"))
-    {
+    // If we are being asked to link, delegate to the linker action.
+    if has_linking_args() {
         return crate::link::LinkAction::from_env()
             .expect("Linker action not found")
             .run_link()
