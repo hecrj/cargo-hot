@@ -924,7 +924,11 @@ impl Server {
                         out_args.push(original_args[idx + 1].to_string());
                     }
 
-                    if arg.starts_with("-l") || arg.starts_with("-m") {
+                    if arg.starts_with("-l")
+                        || arg.starts_with("-m")
+                        || arg.starts_with("-Wl,-fuse-ld")
+                        || arg.starts_with("-fuse-ld")
+                    {
                         out_args.push(arg.to_string());
                     }
                 }
