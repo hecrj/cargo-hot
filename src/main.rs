@@ -139,7 +139,7 @@ impl Server {
             .args(["--print", "sysroot"])
             .output()
             .await
-            .map(|out| String::from_utf8(out.stdout))?
+            .map(|out| String::from_utf8(out.stdout).map(|s| s.trim().to_string()))?
             .context("Failed to extract rustc sysroot output")?;
 
         let target_kind = if args.contains_id("example") {
@@ -247,7 +247,19 @@ impl Server {
             .map(Filesystem::new)
             .unwrap_or_else(|| workspace.target_dir());
 
-        let custom_linker = cargo_config.linker(triple.to_string())?;
+        let mut custom_linker = cargo_config.linker(triple.to_string())?;
+        if let Some(linker) = custom_linker.as_ref()
+            && (linker == "rust-lld" || linker == "rust-lld.exe")
+            && cfg!(windows)
+        {
+            // When using "rust-lld.exe" as linker on windows, it still needs to have a flavor
+            // given to it. rustc appears to be passing `-flavor "link"` when none is set by the
+            // user. If no flavor is given, it fails with 'lld is a generic driver'.
+            // We already use the existing lld-link by default on windows, so we can simply set the
+            // `custom_linker` to `None` in these cases, since we end up using "lld-link" anyway
+            // which is the same as "rust-lld.exe -flavor link".
+            custom_linker = None;
+        }
 
         let exe_args = args
             .get_many("args")
@@ -300,6 +312,7 @@ impl Server {
             self.link_args_file(),
             self.link_err_file(),
             self.rustc_wrapper_args_file(),
+            self.windows_command_file(),
         ] {
             let _ = std::fs::OpenOptions::new()
                 .write(true)
@@ -310,9 +323,42 @@ impl Server {
 
         let (sender, mut receiver) = mpsc::channel(1);
 
-        let mut watcher = notify::recommended_watcher(move |event| {
-            let _ = sender.blocking_send(event);
-        })?;
+        let handler = move |event: notify::Result<notify::Event>| {
+            let Ok(event) = event else {
+                return;
+            };
+
+            let is_allowed_notify_event = match event.kind {
+                notify::EventKind::Modify(notify::event::ModifyKind::Data(_)) => true,
+                notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => true,
+                // The primary modification event on WSL's poll watcher.
+                notify::EventKind::Modify(notify::event::ModifyKind::Metadata(
+                    notify::event::MetadataKind::WriteTime,
+                )) => true,
+                // Catch-all for unknown event types (windows)
+                notify::EventKind::Modify(notify::event::ModifyKind::Any) => true,
+                notify::EventKind::Modify(notify::event::ModifyKind::Metadata(_)) => false,
+                // Don't care about anything else.
+                notify::EventKind::Create(_) => true,
+                notify::EventKind::Remove(_) => true,
+                _ => false,
+            };
+
+            if is_allowed_notify_event {
+                let _ = sender.blocking_send(event);
+            }
+        };
+
+        let mut watcher: Box<dyn Watcher> = if is_wsl() {
+            // On wsl, we need to poll the filesystem for changes
+            Box::new(notify::PollWatcher::new(
+                handler,
+                notify::Config::default().with_poll_interval(Duration::from_secs(2)),
+            )?)
+        } else {
+            // Otherwise we can use the recommended watcher
+            Box::new(notify::recommended_watcher(handler)?)
+        };
 
         let build = self.build(BuildMode::Fat).await?;
         let mut executable = tokio::process::Command::new(self.main_exe())
@@ -347,13 +393,6 @@ impl Server {
             let changed_files: BTreeSet<PathBuf> = buffer
                 .drain(..n)
                 .filter_map(|event| {
-                    let event = event.ok()?;
-
-                    let notify::EventKind::Modify(notify::event::ModifyKind::Data(_)) = event.kind
-                    else {
-                        return None;
-                    };
-
                     let path = event.paths.first()?;
 
                     if path != &path.with_extension("rs") {
@@ -427,7 +466,7 @@ impl Server {
 
         // Populate the patch cache if we're in fat mode
         if matches!(mode, BuildMode::Fat) {
-            build.patch_cache = Some(Arc::new(self.create_patch_cache().await?));
+            build.patch_cache = Some(Arc::new(self.create_patch_cache(&build.exe).await?));
         }
 
         Ok(build)
@@ -459,9 +498,9 @@ impl Server {
         Ok(())
     }
 
-    async fn create_patch_cache(&self) -> Result<hotpatch::Cache> {
+    async fn create_patch_cache(&self, exe: &Path) -> Result<hotpatch::Cache> {
         // TODO: Wasm
-        let exe = self.main_exe().to_path_buf();
+        let exe = exe.to_path_buf();
 
         Ok(hotpatch::Cache::new(&exe, &self.triple)?)
     }
@@ -777,15 +816,28 @@ impl Server {
 
         log::trace!("Linking with {linker:?} using args: {object_files:#?}");
 
+        let mut out_args: Vec<OsString> = vec![];
+        out_args.extend(object_files.iter().map(Into::into));
+        out_args.extend(dylibs.iter().map(Into::into));
+        out_args.extend(self.thin_link_args(&args)?.iter().map(Into::into));
+        out_args.extend(out_arg.iter().map(Into::into));
+
+        if cfg!(windows) {
+            let cmd_contents: String = out_args
+                .iter()
+                .map(|s| format!("\"{}\"", s.to_string_lossy()))
+                .join(" ");
+            std::fs::write(self.windows_command_file(), cmd_contents)
+                .context("Failed to write linker command file")?;
+            out_args = vec![format!("@{}", self.windows_command_file().display()).into()];
+        }
+
         // Run the linker directly!
         //
         // We dump its output directly into the patch exe location which is different than how rustc
         // does it since it uses llvm-objcopy into the `target/debug/` folder.
         let res = tokio::process::Command::new(linker)
-            .args(object_files.iter())
-            .args(dylibs.iter())
-            .args(self.thin_link_args(&args)?)
-            .args(out_arg)
+            .args(out_args)
             .env_clear()
             .envs(rustc_args.envs.iter().map(|(k, v)| (k, v)))
             .output()
@@ -1162,6 +1214,7 @@ impl Server {
 
                 let rlib_contents = std::fs::read(rlib)?;
                 let mut reader = ar::Archive::new(std::io::Cursor::new(rlib_contents));
+                let mut keep_linker_rlib = false;
                 while let Some(Ok(object_file)) = reader.next_entry() {
                     let name = std::str::from_utf8(object_file.header().identifier()).unwrap();
                     if name.ends_with(".rmeta") {
@@ -1173,23 +1226,29 @@ impl Server {
                     }
 
                     // rlibs might contain dlls/sos/lib files which we don't want to include
-                    if name.ends_with(".dll")
-                        || name.ends_with(".so")
-                        || name.ends_with(".lib")
-                        || name.ends_with(".dylib")
-                    {
-                        compiler_rlibs.push(rlib.to_owned());
+                    //
+                    // This catches .dylib, .so, .dll, .lib, .o, etc files that are not compatible with
+                    // our "fat archive" linking process.
+                    //
+                    // We only trust `.rcgu.o` files to make it into the --all_load archive.
+                    // This is a temporary stopgap to prevent issues with libraries that generate
+                    // object files that are not compatible with --all_load.
+                    // see https://github.com/DioxusLabs/dioxus/issues/4237
+                    if !(name.ends_with(".rcgu.o") || name.ends_with(".obj")) {
+                        keep_linker_rlib = true;
                         continue;
-                    }
-
-                    if !(name.ends_with(".o") || name.ends_with(".obj")) {
-                        log::debug!("Unknown object file in rlib: {name:?}");
                     }
 
                     archive_has_contents = true;
                     out_ar
                         .append(&object_file.header().clone(), object_file)
                         .context("Failed to add object file to archive")?;
+                }
+
+                // Some rlibs contain weird artifacts that we don't want to include in the fat archive.
+                // However, we still want them around in the linker in case the regular linker can handle them.
+                if keep_linker_rlib {
+                    compiler_rlibs.push(rlib.clone());
                 }
             }
 
@@ -1307,21 +1366,37 @@ impl Server {
         //     args.remove(flavor_idx);
         // }
 
+        // Set the output file
+        match self.triple.operating_system {
+            OperatingSystem::Windows => args.push(format!("/OUT:{}", exe.display())),
+            _ => args.extend(["-o".to_string(), exe.display().to_string()]),
+        }
+
         // And now we can run the linker with our new args
         let linker = self.select_linker()?;
 
-        log::trace!("Fat linking with args: {linker:?} {args:#?}");
-        log::trace!("Fat linking with env: {:#?}", rustc_args.envs);
+        log::trace!("Fat linking with args: {:?} {:#?}", linker, args);
+        log::trace!("Fat linking with env:");
+        for e in rustc_args.envs.iter() {
+            log::trace!("  {}={}", e.0, e.1);
+        }
+
+        // Handle windows command files
+        let mut out_args = args.clone();
+        if cfg!(windows) {
+            let cmd_contents: String = out_args
+                .iter()
+                .skip(1)
+                .map(|f| format!("\"{f}\""))
+                .join(" ");
+            std::fs::write(self.windows_command_file(), cmd_contents)
+                .context("Failed to write linker command file")?;
+            out_args = vec![format!("@{}", self.windows_command_file().display())];
+        }
 
         // Run the linker directly!
-        let out_arg = match self.triple.operating_system {
-            OperatingSystem::Windows => vec![format!("/OUT:{}", exe.display())],
-            _ => vec!["-o".to_string(), exe.display().to_string()],
-        };
-
         let res = tokio::process::Command::new(linker)
-            .args(args.iter().skip(1))
-            .args(out_arg)
+            .args(out_args)
             .env_clear()
             .envs(rustc_args.envs.iter().map(|(k, v)| (k, v)))
             .output()
@@ -1620,6 +1695,14 @@ impl Server {
         cargo_args.push("--".to_string());
         cargo_args.extend(self.extra_rustc_args.clone());
 
+        if cfg!(target_os = "windows") {
+            // On windows, we pass /SUBSYSTEM:WINDOWS to prevent a console from appearing
+            cargo_args.push("-Clink-arg=/SUBSYSTEM:WINDOWS".to_string());
+            // We also need to set the entry point to mainCRTStartup to avoid windows looking
+            // for a WinMain function
+            cargo_args.push("-Clink-arg=/ENTRY:mainCRTStartup".to_string());
+        }
+
         // TODO
         // The bundle splitter needs relocation data to create a call-graph.
         // This will automatically be erased by wasm-opt during the optimization step.
@@ -1788,6 +1871,10 @@ impl Server {
     fn rustc_wrapper_args_file(&self) -> PathBuf {
         self.exe_dir().join("rustc_wrapper_args.txt")
     }
+
+    fn windows_command_file(&self) -> PathBuf {
+        self.exe_dir().join("windows_command.txt")
+    }
 }
 
 fn select_ranlib() -> Option<PathBuf> {
@@ -1827,4 +1914,37 @@ async fn read_batch<T>(
     }
 
     n
+}
+
+/// Detects if `dx` is being ran in a WSL environment.
+///
+/// We determine this based on whether the keyword `microsoft` or `wsl` is contained within the `WSL_1` or `WSL_2` files.
+/// This may fail in the future as it isn't guaranteed by Microsoft.
+/// See <https://github.com/microsoft/WSL/issues/423#issuecomment-221627364>
+fn is_wsl() -> bool {
+    const WSL_1: &str = "/proc/sys/kernel/osrelease";
+    const WSL_2: &str = "/proc/version";
+    const WSL_KEYWORDS: [&str; 2] = ["microsoft", "wsl"];
+
+    // Test 1st File
+    if let Ok(content) = std::fs::read_to_string(WSL_1) {
+        let lowercase = content.to_lowercase();
+        for keyword in WSL_KEYWORDS {
+            if lowercase.contains(keyword) {
+                return true;
+            }
+        }
+    }
+
+    // Test 2nd File
+    if let Ok(content) = std::fs::read_to_string(WSL_2) {
+        let lowercase = content.to_lowercase();
+        for keyword in WSL_KEYWORDS {
+            if lowercase.contains(keyword) {
+                return true;
+            }
+        }
+    }
+
+    false
 }
