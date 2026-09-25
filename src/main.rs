@@ -112,12 +112,15 @@ pub struct Server {
     target_dir: Filesystem,
     custom_linker: Option<PathBuf>,
     metadata: cargo_metadata::Metadata,
+    /// Maps every file a crate depends on (from rustc dep-info files) to the crate that
+    /// includes it. Change events are matched against this map so edits to non-`.rs`
+    /// inputs (like `include_str!` targets or generated files) also trigger a patch.
+    depinfo: std::sync::Mutex<HashMap<PathBuf, String>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Build {
     exe: PathBuf,
-    is_fresh: bool,
     workspace_rustc: rustc::WorkspaceRustcArgs,
     time_start: SystemTime,
     patch_cache: Option<Arc<hotpatch::Cache>>,
@@ -312,6 +315,7 @@ impl Server {
             target_dir,
             custom_linker,
             metadata,
+            depinfo: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -406,36 +410,50 @@ impl Server {
                 return Err(anyhow!("file notifier failed"));
             }
 
-            let changed_files: BTreeSet<PathBuf> = buffer
-                .drain(..n)
-                .filter_map(|event| {
-                    let path = event.paths.first()?;
+            // Collect the changed files and attribute them to crates. The dep-info filemap is
+            // the precise source (it covers non-`.rs` inputs like `include_str!` targets, even
+            // ones under `target/`); the workspace-dir heuristic below is the fallback for
+            // files the filemap doesn't know yet.
+            let mut changed_files: BTreeSet<PathBuf> = BTreeSet::new();
+            let mut changed_crates: HashSet<String> = HashSet::new();
+            let mut heuristic_files: BTreeSet<PathBuf> = BTreeSet::new();
 
-                    if path != &path.with_extension("rs") {
-                        return None;
+            {
+                let depinfo = self.depinfo.lock().unwrap();
+                for event in buffer.drain(..n) {
+                    for path in event.paths {
+                        if let Some(crate_name) = depinfo.get(&path) {
+                            let _ = changed_files.insert(path);
+                            let _ = changed_crates.insert(crate_name.clone());
+                        } else if path == path.with_extension("rs")
+                            && // Ignore anything under a `target` directory - a member whose
+                               // source dir is the workspace root would otherwise pick up the
+                               // whole target tree.
+                            !path.components().any(|component| {
+                                matches!(
+                                    component,
+                                    std::path::Component::Normal(name) if name == "target"
+                                )
+                            })
+                        {
+                            let _ = changed_files.insert(path.clone());
+                            let _ = heuristic_files.insert(path);
+                        }
                     }
+                }
+            }
 
-                    // Ignore anything under a `target` directory - a member whose source dir is
-                    // the workspace root would otherwise pick up the whole target tree.
-                    if path.components().any(|component| {
-                        matches!(component, std::path::Component::Normal(name) if name == "target")
-                    }) {
-                        return None;
-                    }
-
-                    Some(event.paths)
-                })
-                .flatten()
-                .collect();
+            // Files the filemap doesn't know yet resolve to the workspace member whose
+            // crate directory contains them.
+            for file in &heuristic_files {
+                if let Some(crate_name) = self.file_to_workspace_crate(file) {
+                    let _ = changed_crates.insert(crate_name);
+                }
+            }
 
             if changed_files.is_empty() {
                 continue;
             }
-
-            let changed_crates: HashSet<String> = changed_files
-                .iter()
-                .filter_map(|file| self.file_to_workspace_crate(file))
-                .collect();
 
             // Expand the cumulative modified set with the workspace dependents of each
             // changed crate. Only crates that cascade to the tip matter - the rest are
@@ -529,13 +547,22 @@ impl Server {
 
                 log::debug!("Replaying workspace crate '{crate_name}'");
 
-                self.compile_dep_crate(crate_name, rustc_args)
+                self.compile_dep_crate(crate_name, &rustc_args)
                     .await
                     .with_context(|| format!("Failed to replay workspace crate '{crate_name}'"))?;
+
+                // rustc just rewrote this crate's dep-info - fold its inputs into the
+                // filemap so edits to its `include_str!` targets and co. trigger a patch.
+                self.refresh_dep_info(crate_name, &rustc_args, true);
             }
         }
 
-        // Run the cargo build to produce our artifacts
+        // Run the cargo build to produce our artifacts. For fat builds the filemap starts
+        // fresh - it gets repopulated from the dep-info of every member below.
+        if matches!(mode, BuildMode::Fat) {
+            self.depinfo.lock().unwrap().clear();
+        }
+
         let mut build = self.cargo_build(&mode).await?;
 
         // Write the build artifacts to the bundle on the disk
@@ -548,15 +575,64 @@ impl Server {
             } => {
                 self.write_patch(*aslr_reference, &mut build, cache, modified_crates)
                     .await?;
+
+                // The tip was just recompiled - rustc rewrote its dep-info, so fold any new
+                // inputs (e.g. a fresh `include_str!` target) into the filemap. Existing
+                // entries win so shared files still trigger the dependency's replay.
+                let tip_key = format!("{}.bin", self.tip_crate_name());
+                if let Some(tip_args) = build.workspace_rustc.rustc_args.get(&tip_key) {
+                    self.refresh_dep_info(&self.tip_crate_name(), tip_args, false);
+                }
             }
 
             BuildMode::Fat => {
-                if !build.is_fresh {
+                // Sync the executable into the exe dir. This can be needed even for fresh
+                // builds - a previous run may have built the artifact but failed to copy
+                // it (e.g. the old executable was still running: ETXTBSY).
+                let exe_mtime = std::fs::metadata(&build.exe).and_then(|meta| meta.modified());
+                let main_mtime =
+                    std::fs::metadata(self.main_exe()).and_then(|meta| meta.modified());
+
+                let needs_copy = match (exe_mtime, main_mtime) {
+                    (Ok(exe_mtime), Ok(main_mtime)) => exe_mtime > main_mtime,
+                    _ => true,
+                };
+
+                if needs_copy {
                     self.write_executable(&build.exe)
                         .await
                         .context("Failed to write main executable")?;
 
                     log::debug!("Binary created at {}", self.build_dir().display());
+                }
+
+                // Populate the filemap from the dep-info of every captured workspace member.
+                // The dep-info files on disk are current in either case: recompiled members
+                // just had theirs rewritten, and fresh members' paths are unchanged.
+                //
+                // The tip is registered last so that a file shared between the tip and a
+                // dependency keeps the dependency's entry - editing it then triggers the
+                // dependency's replay, whose closure also rebuilds the tip.
+                let tip_crate = self.tip_crate_name();
+
+                for (key, args) in build.workspace_rustc.rustc_args.iter() {
+                    let Some((crate_name, _)) = key.rsplit_once('.') else {
+                        continue;
+                    };
+
+                    if *crate_name != tip_crate {
+                        self.refresh_dep_info(crate_name, args, false);
+                    }
+                }
+
+                for suffix in ["lib", "bin"] {
+                    if let Some(args) = build
+                        .workspace_rustc
+                        .rustc_args
+                        .get(&format!("{tip_crate}.{suffix}"))
+                    {
+                        self.refresh_dep_info(&tip_crate, args, false);
+                    }
                 }
             }
         }
@@ -591,6 +667,13 @@ impl Server {
             &self.triple,
             build.patch_cache.as_ref().unwrap(),
         )?;
+
+        if jump_table.map.is_empty() {
+            log::warn!(
+                "Hot-patch jump table is empty - the patch will have no effect. This usually \
+                 means no symbols in the patch matched the running binary."
+            );
+        }
 
         connection.patch(&jump_table).await?;
 
@@ -650,7 +733,8 @@ impl Server {
                 else => break,
             };
 
-            let Some(Ok(message)) = Message::parse_stream(std::io::Cursor::new(line)).next() else {
+            let Some(Ok(message)) = Message::parse_stream(std::io::Cursor::new(&line)).next()
+            else {
                 continue;
             };
 
@@ -768,7 +852,6 @@ impl Server {
 
         Ok(Build {
             exe,
-            is_fresh: !has_compiled,
             workspace_rustc,
             time_start,
             patch_cache: None,
@@ -1783,9 +1866,12 @@ impl Server {
             // rustc itself in case we're hot-patching and need a reliable rustc environment to
             // continuously recompile the workspace with.
             //
-            // The RUSTC_WRAPPER env var makes cargo route *every* rustc invocation through us, so
-            // we capture the args/env of each crate (one json file per crate in the args dir) and
-            // can replay any of them during a hotpatch.
+            // RUSTC_WORKSPACE_WRAPPER routes only the rustc invocations of *workspace member*
+            // crates through us - exactly the crates a hotpatch can replay. This avoids
+            // capturing every crates.io dependency as well, and (unlike RUSTC_WRAPPER) it is
+            // part of cargo's unit hash: artifacts built by a plain `cargo build` are
+            // considered stale by our next build, so they get recompiled - and therefore
+            // re-captured - automatically.
             //
             // We've also had a number of issues with incorrect canonicalization when passing paths
             // through envs on windows, hence the frequent use of dunce::canonicalize.
@@ -1816,7 +1902,10 @@ impl Server {
                                 .display()
                                 .to_string(),
                         )
-                        .env("RUSTC_WRAPPER", path_to_me()?.display().to_string());
+                        .env(
+                            "RUSTC_WORKSPACE_WRAPPER",
+                            path_to_me()?.display().to_string(),
+                        );
                 }
 
                 log::debug!("Cargo: {cmd:#?}");
@@ -2504,7 +2593,7 @@ impl Server {
     ///
     /// The captured args are replayed verbatim (except for the linker override) so the rlib is
     /// rewritten in place with the latest code, ready to be linked into the patch.
-    async fn compile_dep_crate(&self, crate_name: &str, rustc_args: rustc::Args) -> Result<()> {
+    async fn compile_dep_crate(&self, crate_name: &str, rustc_args: &rustc::Args) -> Result<()> {
         use tokio::io::AsyncBufReadExt;
 
         let mut cmd = tokio::process::Command::new("rustc");
@@ -2528,7 +2617,7 @@ impl Server {
         let _ = cmd.current_dir(cwd);
 
         // Drop the wrapper/linker interception env vars - the replay is a plain rustc invocation
-        let mut envs = rustc_args.envs;
+        let mut envs = rustc_args.envs.clone();
         envs.retain_mut(|(key, _)| {
             !key.starts_with("DX_LINK")
                 && !matches!(
@@ -2608,6 +2697,40 @@ impl Server {
         }
 
         Ok(())
+    }
+
+    /// Fold a crate's dep-info file into the filemap, mapping every input file to the crate.
+    ///
+    /// Existing entries are left alone unless `overwrite` is set - dependency crates are
+    /// registered after the tip so that a file shared between them triggers the dependency's
+    /// replay (whose closure then also recompiles the tip).
+    fn refresh_dep_info(&self, crate_name: &str, rustc_args: &rustc::Args, overwrite: bool) {
+        let Some(dep_info_path) = rustc::dep_info_path_for_rustc_args(&rustc_args.args) else {
+            return;
+        };
+
+        // Rustc writes the dep-info relative to the compilation's working directory
+        let cwd = if rustc_args.cwd.as_os_str().is_empty() {
+            &self.workspace_dir
+        } else {
+            &rustc_args.cwd
+        };
+
+        let files = rustc::parse_dep_info_files(&dep_info_path, cwd);
+        if files.is_empty() {
+            log::debug!(
+                "No dep-info files found for '{crate_name}' at {}",
+                dep_info_path.display()
+            );
+            return;
+        }
+
+        let mut depinfo = self.depinfo.lock().unwrap();
+        for file in files {
+            if overwrite || !depinfo.contains_key(&file) {
+                let _ = depinfo.insert(file, crate_name.to_string());
+            }
+        }
     }
 
     /// Load the rustc args the wrapper captured for every crate during the build, along with the

@@ -126,10 +126,12 @@ pub fn run_rustc() {
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .current_dir(std::env::current_dir().expect("Failed to get current dir"))
-        .status();
+        .status()
+        .expect("Failed to execute rustc command");
 
-    // Propagate the exit code
-    std::process::exit(rustc.unwrap().code().unwrap())
+    // Propagate the exit code. If rustc was killed by a signal there is no exit
+    // code, so bail out with 1 to fail the build instead of panicking.
+    std::process::exit(rustc.code().unwrap_or(1))
 }
 
 /// Write the captured rustc args to `{args_dir}/{crate_name}.{suffix}.json`.
@@ -174,4 +176,109 @@ fn write_rustc_args(args_dir: &Path, rustc_args: &Args) {
         serde_json::to_string(&serialized).expect("Failed to serialize rustc args"),
     )
     .expect("Failed to write rustc args to file");
+}
+
+/// Reconstruct the dep-info `.d` path that rustc writes for an invocation, by parsing the
+/// `--out-dir`, `--crate-name`, and `-C extra-filename=` args. This mirrors rustc's own
+/// naming convention: `<out_dir>/<crate_name><extra_filename>.d`.
+pub fn dep_info_path_for_rustc_args(args: &[String]) -> Option<PathBuf> {
+    let mut out_dir: Option<&str> = None;
+    let mut crate_name: Option<&str> = None;
+    let mut extra = String::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "--out-dir" => {
+                out_dir = args.get(i + 1).map(String::as_str);
+                i += 2;
+                continue;
+            }
+            "--crate-name" => {
+                crate_name = args.get(i + 1).map(String::as_str);
+                i += 2;
+                continue;
+            }
+            "-C" => {
+                if let Some(next) = args.get(i + 1)
+                    && let Some(val) = next.strip_prefix("extra-filename=")
+                {
+                    extra = val.to_string();
+                }
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+
+        if let Some(rest) = arg.strip_prefix("--out-dir=") {
+            out_dir = Some(rest);
+        } else if let Some(rest) = arg.strip_prefix("--crate-name=") {
+            crate_name = Some(rest);
+        } else if let Some(rest) = arg.strip_prefix("-Cextra-filename=") {
+            extra = rest.to_string();
+        }
+
+        i += 1;
+    }
+
+    let out_dir = out_dir?;
+    let crate_name = crate_name?;
+    Some(PathBuf::from(out_dir).join(format!("{crate_name}{extra}.d")))
+}
+
+/// Parse a rustc dep-info (`.d`) file and return the list of input files it depends on,
+/// canonicalized against the working directory the compilation ran in.
+///
+/// The format is `target: dep1 dep2 ...` where a dependency ending in a backslash continues
+/// on the next line (escaped spaces). Only the file list is of interest - env var lines
+/// (`# env-dep: ...`) are ignored.
+pub fn parse_dep_info_files(path: &Path, cwd: &Path) -> Vec<PathBuf> {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+
+    let mut files = Vec::new();
+    let mut found_deps = false;
+
+    for line in contents.lines() {
+        // Skip env-var dependency lines (`# env-dep: ...`) - only the file list matters.
+        if line.starts_with("# env-dep:") {
+            continue;
+        }
+
+        let Some(pos) = line.find(": ") else {
+            continue;
+        };
+
+        if found_deps {
+            continue;
+        }
+        found_deps = true;
+
+        let mut deps = line[pos + 2..].split_whitespace();
+        while let Some(file) = deps.next() {
+            let mut file = file.to_string();
+            while file.ends_with('\\') {
+                let _ = file.pop();
+                match deps.next() {
+                    Some(next) => {
+                        file.push(' ');
+                        file.push_str(next);
+                    }
+                    None => break,
+                }
+            }
+
+            let absolute = if Path::new(&file).is_absolute() {
+                PathBuf::from(&file)
+            } else {
+                cwd.join(&file)
+            };
+            files.push(dunce::canonicalize(&absolute).unwrap_or(absolute));
+        }
+    }
+
+    files
 }
