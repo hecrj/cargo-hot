@@ -8,14 +8,14 @@ use cargo::GlobalContext;
 use cargo::core::{Target, TargetKind};
 use cargo::util::{Filesystem, command_prelude::*};
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, ensure};
 use itertools::Itertools;
 use serde::Deserialize;
 use target_lexicon::{Architecture, OperatingSystem, Triple};
 use tokio::process;
 use tokio::sync::mpsc;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -111,13 +111,14 @@ pub struct Server {
     no_default_features: bool,
     target_dir: Filesystem,
     custom_linker: Option<PathBuf>,
+    metadata: cargo_metadata::Metadata,
 }
 
 #[derive(Clone, Debug)]
 pub struct Build {
     exe: PathBuf,
     is_fresh: bool,
-    direct_rustc: rustc::Args,
+    workspace_rustc: rustc::WorkspaceRustcArgs,
     time_start: SystemTime,
     patch_cache: Option<Arc<hotpatch::Cache>>,
 }
@@ -126,7 +127,10 @@ pub struct Build {
 pub enum BuildMode {
     Fat,
     Thin {
-        rustc_args: rustc::Args,
+        workspace_rustc: rustc::WorkspaceRustcArgs,
+        /// Every crate modified since the fat build, including transitive workspace
+        /// dependents. Each patch links the latest version of all of these crates.
+        modified_crates: HashSet<String>,
         changed_files: Vec<PathBuf>,
         aslr_reference: u64,
         cache: Arc<hotpatch::Cache>,
@@ -280,6 +284,13 @@ impl Server {
         let crate_dir = main_package.manifest_path().parent().unwrap().to_path_buf();
         let workspace_dir = workspace.root_manifest().parent().unwrap().to_path_buf();
 
+        // Resolve the workspace dependency graph so hotpatches can track which crates
+        // are affected when a workspace member changes.
+        let metadata = cargo_metadata::MetadataCommand::new()
+            .current_dir(&workspace_dir)
+            .exec()
+            .context("Failed to read cargo metadata for the workspace")?;
+
         Ok(Self {
             gctx,
             sysroot: PathBuf::from(sysroot),
@@ -300,6 +311,7 @@ impl Server {
             no_default_features: args.get_flag("no-default-features"),
             target_dir,
             custom_linker,
+            metadata,
         })
     }
 
@@ -311,7 +323,6 @@ impl Server {
         for file in [
             self.link_args_file(),
             self.link_err_file(),
-            self.rustc_wrapper_args_file(),
             self.windows_command_file(),
         ] {
             let _ = std::fs::OpenOptions::new()
@@ -320,6 +331,9 @@ impl Server {
                 .truncate(false)
                 .open(file)?;
         }
+
+        // The rustc wrapper writes one json file per crate into this directory
+        let _ = std::fs::create_dir_all(self.rustc_wrapper_args_dir());
 
         let (sender, mut receiver) = mpsc::channel(1);
 
@@ -365,18 +379,20 @@ impl Server {
             .args(&self.exe_args)
             .spawn()?;
 
-        watcher.watch(
-            self.crate_target
-                .src_path()
-                .path()
-                .and_then(|path| path.parent())
-                .expect("Get source path"),
-            notify::RecursiveMode::Recursive,
-        )?;
+        // Watch every workspace member so edits to dependency crates trigger hotpatches
+        for member_dir in self.workspace_member_dirs() {
+            watcher.watch(&member_dir, notify::RecursiveMode::Recursive)?;
+        }
 
         let mut server = server::Server::bind().await?;
         let mut connection = server.accept().await?;
         let mut buffer = Vec::new();
+
+        // Every crate modified since the fat build. Each patch is self-contained and links
+        // the latest version of *all* of these crates, not just the one that changed in the
+        // current iteration.
+        let mut modified_crates: HashSet<String> = HashSet::new();
+        let _ = modified_crates.insert(self.tip_package_name());
 
         loop {
             let n = tokio::select! {
@@ -399,12 +415,57 @@ impl Server {
                         return None;
                     }
 
+                    // Ignore anything under a `target` directory - a member whose source dir is
+                    // the workspace root would otherwise pick up the whole target tree.
+                    if path.components().any(|component| {
+                        matches!(component, std::path::Component::Normal(name) if name == "target")
+                    }) {
+                        return None;
+                    }
+
                     Some(event.paths)
                 })
                 .flatten()
                 .collect();
 
             if changed_files.is_empty() {
+                continue;
+            }
+
+            let changed_crates: HashSet<String> = changed_files
+                .iter()
+                .filter_map(|file| self.file_to_workspace_crate(file))
+                .collect();
+
+            // Expand the cumulative modified set with the workspace dependents of each
+            // changed crate. Only crates that cascade to the tip matter - the rest are
+            // unrelated to this binary and were never built by the fat build.
+            let tip_package_name = self.tip_package_name();
+            let mut reaches_tip = false;
+            for crate_name in &changed_crates {
+                if *crate_name == tip_package_name {
+                    reaches_tip = true;
+                    continue;
+                }
+
+                let closure = self.workspace_dependent_closure(crate_name);
+                if !closure.contains(&tip_package_name) {
+                    continue;
+                }
+
+                reaches_tip = true;
+                for dependent in closure {
+                    if dependent != tip_package_name {
+                        let _ = modified_crates.insert(dependent);
+                    }
+                }
+            }
+
+            if !reaches_tip {
+                log::debug!(
+                    "Changes to {changed_crates:?} do not affect `{tip_package_name}`; \
+                     skipping patch"
+                );
                 continue;
             }
 
@@ -419,7 +480,10 @@ impl Server {
 
             let start = Instant::now();
 
-            match self.patch(&build, changed_files, &mut connection).await {
+            match self
+                .patch(&build, changed_files, &modified_crates, &mut connection)
+                .await
+            {
                 Ok(()) => {
                     let _ = self.gctx.shell().status(
                         "Finished",
@@ -438,6 +502,39 @@ impl Server {
     }
 
     async fn build(&self, mode: BuildMode) -> Result<Build> {
+        // Before a fat build, make sure every workspace member in the tip's tree gets
+        // captured by the rustc wrapper (cleaning any that are missing a capture).
+        if matches!(mode, BuildMode::Fat) {
+            self.ensure_workspace_captures().await?;
+        }
+
+        // Rebuild the modified workspace dependency crates before recompiling the tip, so the
+        // tip's codegen reads their fresh rlibs and the patch can link the new code in.
+        if let BuildMode::Thin {
+            workspace_rustc,
+            modified_crates,
+            ..
+        } = &mode
+        {
+            let replayed_crates = self.workspace_hotpatch_replay_order(modified_crates)?;
+            for crate_name in &replayed_crates {
+                let Some(rustc_args) =
+                    self.workspace_hotpatch_replay_args(workspace_rustc, crate_name)
+                else {
+                    // The crate isn't actually built by the fat build (e.g. it only reaches
+                    // the tip through a disabled feature) - nothing to replay
+                    log::debug!("Skipping workspace crate '{crate_name}': no captured rustc args");
+                    continue;
+                };
+
+                log::debug!("Replaying workspace crate '{crate_name}'");
+
+                self.compile_dep_crate(crate_name, rustc_args)
+                    .await
+                    .with_context(|| format!("Failed to replay workspace crate '{crate_name}'"))?;
+            }
+        }
+
         // Run the cargo build to produce our artifacts
         let mut build = self.cargo_build(&mode).await?;
 
@@ -446,10 +543,10 @@ impl Server {
             BuildMode::Thin {
                 aslr_reference,
                 cache,
-                rustc_args,
+                modified_crates,
                 ..
             } => {
-                self.write_patch(*aslr_reference, &mut build, cache, rustc_args)
+                self.write_patch(*aslr_reference, &mut build, cache, modified_crates)
                     .await?;
             }
 
@@ -476,11 +573,13 @@ impl Server {
         &self,
         build: &Build,
         changed_files: BTreeSet<PathBuf>,
+        modified_crates: &HashSet<String>,
         connection: &mut server::Connection,
     ) -> Result<()> {
         let patch = self
             .build(BuildMode::Thin {
-                rustc_args: build.direct_rustc.clone(),
+                workspace_rustc: build.workspace_rustc.clone(),
+                modified_crates: modified_crates.clone(),
                 changed_files: changed_files.into_iter().collect(),
                 aslr_reference: connection.aslr_reference() as u64,
                 cache: build.patch_cache.clone().unwrap(),
@@ -629,13 +728,8 @@ impl Server {
             }
         }
 
-        // Accumulate the rustc args from the wrapper, if they exist and can be parsed.
-        let mut direct_rustc = rustc::Args::default();
-        if let Ok(res) = std::fs::read_to_string(self.rustc_wrapper_args_file())
-            && let Ok(res) = serde_json::from_str(&res)
-        {
-            direct_rustc = res;
-        }
+        // Accumulate the rustc args the wrapper captured for every crate in the build
+        let workspace_rustc = self.load_rustc_argset()?;
 
         // If there's any warnings from the linker, we should print them out
         if let Ok(linker_warnings) = std::fs::read_to_string(self.link_err_file())
@@ -648,19 +742,12 @@ impl Server {
             }
         }
 
-        // Collect the linker args from the and update the rustc args
-        direct_rustc.link_args = std::fs::read_to_string(self.link_args_file())
-            .context("Failed to read link args from file")?
-            .lines()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>();
-
         let exe = output_location.context("Cargo build failed - no output location. Toggle tracing mode (press `t`) for more information.")?;
 
         // Fat builds need to be linked with the fat linker. Would also like to link here for thin builds
         if matches!(mode, BuildMode::Fat) && has_compiled {
             let link_start = SystemTime::now();
-            self.run_fat_link(&exe, &direct_rustc).await?;
+            self.run_fat_link(&exe, &workspace_rustc).await?;
 
             log::debug!(
                 "Fat linking completed in {}us",
@@ -682,7 +769,7 @@ impl Server {
         Ok(Build {
             exe,
             is_fresh: !has_compiled,
-            direct_rustc,
+            workspace_rustc,
             time_start,
             patch_cache: None,
         })
@@ -693,7 +780,7 @@ impl Server {
         aslr_reference: u64,
         build: &mut Build,
         cache: &Arc<hotpatch::Cache>,
-        rustc_args: &rustc::Args,
+        modified_crates: &HashSet<String>,
     ) -> anyhow::Result<()> {
         log::debug!(
             "Original builds for patch: {}",
@@ -704,6 +791,23 @@ impl Server {
             .context("Failed to read link args from file")?;
 
         let args = raw_args.lines().collect::<Vec<_>>();
+
+        // The captured args of the tip crate's bin target, used for the linker environment
+        let tip_crate_key = format!("{}.bin", self.tip_crate_name());
+        let tip_rustc_args = build
+            .workspace_rustc
+            .rustc_args
+            .get(&tip_crate_key)
+            .with_context(|| {
+                format!("Missing captured rustc args for the tip crate '{tip_crate_key}'")
+            })?;
+
+        // Include the rlibs of every replayed workspace crate in the patch. Their code changed
+        // since the fat build, so it must be linked in instead of being resolved via stubs.
+        let replayed_crates = self.workspace_hotpatch_replay_order(modified_crates)?;
+        let workspace_rlibs =
+            self.workspace_hotpatch_link_rlibs(&build.workspace_rustc, &replayed_crates)?;
+        log::debug!("Workspace rlibs for patch: {workspace_rlibs:?}");
 
         // Extract out the incremental object files.
         //
@@ -765,6 +869,8 @@ impl Server {
             .map(PathBuf::from)
             .collect::<Vec<_>>();
 
+        object_files.extend(workspace_rlibs);
+
         // On non-wasm platforms, we generate a special shim object file which converts symbols from
         // fat binary into direct addresses from the running process.
         //
@@ -794,7 +900,7 @@ impl Server {
 
             // Add the dylibs/sos to the linker args
             // Make sure to use the one in the bundle, not the ones in the target dir or system.
-            for arg in &rustc_args.link_args {
+            for arg in args.iter() {
                 if arg.ends_with(".dylib") || arg.ends_with(".so") {
                     let path = PathBuf::from(arg);
                     dylibs.push(self.frameworks_folder().join(path.file_name().unwrap()));
@@ -829,7 +935,7 @@ impl Server {
         }
 
         // Add more search paths for the linker
-        let mut command_envs: Vec<(String, String)> = rustc_args.envs.clone();
+        let mut command_envs: Vec<(String, String)> = tip_rustc_args.envs.clone();
 
         // On linux, we need to set a more complete PATH for the linker to find its libraries
         if cfg!(target_os = "linux") {
@@ -870,7 +976,10 @@ impl Server {
 
         // Clean up the temps manually
         // todo: we might want to keep them around for debugging purposes
-        for file in object_files {
+        //
+        // The workspace rlibs are left in place - they're the real cargo outputs and the next
+        // patch reuses them.
+        for file in object_files.iter().filter(|file| !file.ends_with(".rlib")) {
             _ = std::fs::remove_file(file);
         }
 
@@ -1156,11 +1265,27 @@ impl Server {
     ///
     /// todo: I think we can traverse our immediate dependencies and inspect their symbols, unless they `pub use` a crate
     /// todo: we should try and make this faster with memmapping
-    pub(crate) async fn run_fat_link(&self, exe: &Path, rustc_args: &rustc::Args) -> Result<()> {
+    pub(crate) async fn run_fat_link(
+        &self,
+        exe: &Path,
+        workspace_rustc_args: &rustc::WorkspaceRustcArgs,
+    ) -> Result<()> {
         use uuid::Uuid;
 
+        // Get the rustc args of the tip crate's bin target, used for the linker environment
+        let rustc_args = workspace_rustc_args
+            .rustc_args
+            .get(&format!("{}.bin", self.tip_crate_name()))
+            .context("Missing rustc capture for the tip crate")?;
+
+        ensure!(
+            !workspace_rustc_args.link_args.is_empty(),
+            "Missing linker args for the fat link of '{}'. The tip crate likely did not run through linker interception for this build.",
+            self.tip_crate_name()
+        );
+
         // Filter out the rlib files from the arguments
-        let rlibs = rustc_args
+        let rlibs = workspace_rustc_args
             .link_args
             .iter()
             .filter(|arg| arg.ends_with(".rlib"))
@@ -1300,7 +1425,7 @@ impl Server {
         // And then remove the rest of the rlibs
         //
         // We also need to insert the -force_load flag to force the linker to load the archive
-        let mut args = rustc_args.link_args.clone();
+        let mut args = workspace_rustc_args.link_args.clone();
 
         if let Some(last_object) = args.iter().rposition(|arg| arg.ends_with(".o"))
             && archive_has_contents
@@ -1605,7 +1730,21 @@ impl Server {
             // ends up doing some recursive nonsense and dx is trying to link instead of compiling.
             //
             // todo: maybe rustc needs to be found on the FS instead of using the one in the path?
-            BuildMode::Thin { rustc_args, .. } => {
+            BuildMode::Thin {
+                workspace_rustc, ..
+            } => {
+                let tip_crate_key = format!("{}.bin", self.tip_crate_name());
+                let rustc_args = workspace_rustc
+                    .rustc_args
+                    .get(&tip_crate_key)
+                    .with_context(|| {
+                        format!(
+                            "Missing captured rustc args for the tip crate '{tip_crate_key}' \
+                             (available: {:?})",
+                            workspace_rustc.rustc_args.keys().collect::<Vec<_>>()
+                        )
+                    })?;
+
                 let mut cmd = tokio::process::Command::new("rustc");
 
                 // Replay the build in the working directory captured by the rustc wrapper when
@@ -1642,11 +1781,11 @@ impl Server {
 
             // For Base and Fat builds, we use a regular cargo setup, but we might need to intercept
             // rustc itself in case we're hot-patching and need a reliable rustc environment to
-            // continuously recompile the top-level crate with.
+            // continuously recompile the workspace with.
             //
-            // In the future, when we support hot-patching *all* workspace crates, we will need to
-            // make use of the RUSTC_WORKSPACE_WRAPPER environment variable instead of RUSTC_WRAPPER
-            // and then keep track of env and args on a per-crate basis.
+            // The RUSTC_WRAPPER env var makes cargo route *every* rustc invocation through us, so
+            // we capture the args/env of each crate (one json file per crate in the args dir) and
+            // can replay any of them during a hotpatch.
             //
             // We've also had a number of issues with incorrect canonicalization when passing paths
             // through envs on windows, hence the frequent use of dunce::canonicalize.
@@ -1664,11 +1803,16 @@ impl Server {
                     .envs(self.cargo_build_env_vars(mode)?);
 
                 if mode == &BuildMode::Fat {
+                    let args_dir = self.rustc_wrapper_args_dir();
+                    let _ = std::fs::create_dir_all(&args_dir);
+
                     let _ = cmd
                         .env(
                             rustc::DX_RUSTC_WRAPPER_ENV_VAR,
-                            dunce::canonicalize(self.rustc_wrapper_args_file())
-                                .unwrap()
+                            dunce::canonicalize(&args_dir)
+                                .with_context(|| {
+                                    format!("Failed to canonicalize {}", args_dir.display())
+                                })?
                                 .display()
                                 .to_string(),
                         )
@@ -1906,8 +2050,594 @@ impl Server {
         self.exe_dir().join("link_err.txt")
     }
 
-    fn rustc_wrapper_args_file(&self) -> PathBuf {
-        self.exe_dir().join("rustc_wrapper_args.txt")
+    fn rustc_wrapper_args_dir(&self) -> PathBuf {
+        self.exe_dir().join("rustc_wrapper_args")
+    }
+
+    /// The rustc crate name (hyphens → underscores) of the tip target, as used by
+    /// `--crate-name` and the per-crate capture keys.
+    fn tip_crate_name(&self) -> String {
+        self.crate_target.name().replace('-', "_")
+    }
+
+    /// The workspace package name of the tip crate (hyphens → underscores).
+    ///
+    /// This can differ from `tip_crate_name()` when the binary target is named differently than
+    /// its package (e.g. package `browser` with `[[bin]] name = "blitz"`). Use this for
+    /// workspace-graph lookups (which are keyed by package name) and `tip_crate_name()` for
+    /// rustc `--crate-name` keys like `{name}.bin`.
+    fn tip_package_name(&self) -> String {
+        self.package.replace('-', "_")
+    }
+
+    /// The source directories of every workspace member.
+    fn workspace_member_dirs(&self) -> Vec<PathBuf> {
+        let member_ids: HashSet<&cargo_metadata::PackageId> =
+            self.metadata.workspace_members.iter().collect();
+
+        self.metadata
+            .packages
+            .iter()
+            .filter(|package| member_ids.contains(&package.id))
+            .filter_map(|package| package.manifest_path.parent().map(PathBuf::from))
+            .collect()
+    }
+
+    /// Map a changed file path to the workspace crate it belongs to.
+    ///
+    /// Returns the crate name in rustc convention (hyphens → underscores), matching the
+    /// `--crate-name` arg used by rustc and the keys in `workspace_rustc_args.rustc_args`.
+    ///
+    /// Finds the workspace member whose crate directory is the longest prefix of the file path.
+    fn file_to_workspace_crate(&self, file: &Path) -> Option<String> {
+        let member_ids: HashSet<&cargo_metadata::PackageId> =
+            self.metadata.workspace_members.iter().collect();
+
+        let mut best_match: Option<(String, usize)> = None;
+
+        for package in self
+            .metadata
+            .packages
+            .iter()
+            .filter(|package| member_ids.contains(&package.id))
+        {
+            let Some(crate_dir) = package.manifest_path.parent() else {
+                continue;
+            };
+
+            if let Ok(relative) = file.strip_prefix(crate_dir) {
+                let depth = relative.components().count();
+                let is_better = best_match
+                    .as_ref()
+                    .is_none_or(|(_, best_depth)| depth < *best_depth);
+
+                if is_better {
+                    best_match = Some((package.name.replace('-', "_"), depth));
+                }
+            }
+        }
+
+        best_match.map(|(name, _)| name)
+    }
+
+    /// The transitive workspace dependencies of a crate (BFS over the resolve graph,
+    /// following edges forward), including the crate itself.
+    fn workspace_dep_closure(&self, crate_name: &str) -> BTreeSet<String> {
+        let Some(resolve) = self.metadata.resolve.as_ref() else {
+            return BTreeSet::new();
+        };
+
+        let member_ids: HashSet<&cargo_metadata::PackageId> =
+            self.metadata.workspace_members.iter().collect();
+        let crate_name = crate_name.replace('-', "_");
+
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        let mut visited: HashSet<&cargo_metadata::PackageId> = HashSet::new();
+        let mut queue: Vec<&cargo_metadata::PackageId> = resolve
+            .nodes
+            .iter()
+            .filter(|node| {
+                member_ids.contains(&node.id)
+                    && self
+                        .metadata
+                        .packages
+                        .iter()
+                        .find(|package| package.id == node.id)
+                        .is_some_and(|package| package.name.replace('-', "_") == crate_name)
+            })
+            .map(|node| &node.id)
+            .collect();
+
+        while let Some(package_id) = queue.pop() {
+            if !visited.insert(package_id) {
+                continue;
+            }
+
+            if member_ids.contains(package_id)
+                && let Some(package) = self
+                    .metadata
+                    .packages
+                    .iter()
+                    .find(|package| package.id == *package_id)
+            {
+                let _ = names.insert(package.name.replace('-', "_"));
+            }
+
+            for node in resolve.nodes.iter().filter(|node| node.id == *package_id) {
+                queue.extend(node.dependencies.iter());
+            }
+        }
+
+        names
+    }
+
+    /// Ensure every workspace member in the tip's dependency tree has a captured rustc
+    /// invocation in the args dir. Members missing a capture (e.g. built by an older
+    /// `cargo-hot` or by plain `cargo build`) are cleaned so the fat build recompiles -
+    /// and therefore captures - them.
+    async fn ensure_workspace_captures(&self) -> Result<()> {
+        let dep_closure = self.workspace_dep_closure(&self.tip_package_name());
+
+        let captured: HashSet<String> = std::fs::read_dir(self.rustc_wrapper_args_dir())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| {
+                        entry.file_name().to_str().and_then(|name| {
+                            name.strip_suffix(".lib.json")
+                                .or_else(|| name.strip_suffix(".bin.json"))
+                                .map(str::to_string)
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for member in dep_closure
+            .iter()
+            .filter(|member| !captured.contains(member.as_str()))
+        {
+            log::debug!(
+                "No rustc capture for workspace member '{member}'; cleaning so the fat \
+                 build recompiles and captures it"
+            );
+
+            let status = process::Command::new("cargo")
+                .arg("clean")
+                .arg("-p")
+                .arg(member.replace('_', "-"))
+                .current_dir(&self.workspace_dir)
+                .status()
+                .await
+                .with_context(|| format!("Failed to run `cargo clean -p {member}`"))?;
+
+            ensure!(
+                status.success(),
+                "Failed to clean workspace member '{member}' before the fat build"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// The direct workspace dependents of a crate - the workspace members that depend on it.
+    fn workspace_dependents_of(&self, crate_name: &str) -> Vec<String> {
+        let Some(resolve) = self.metadata.resolve.as_ref() else {
+            return Vec::new();
+        };
+
+        let member_ids: HashSet<&cargo_metadata::PackageId> =
+            self.metadata.workspace_members.iter().collect();
+        let crate_name = crate_name.replace('-', "_");
+
+        // The ids of every node that is a workspace member with the target name
+        let target_ids: HashSet<&cargo_metadata::PackageId> = resolve
+            .nodes
+            .iter()
+            .filter(|node| {
+                member_ids.contains(&node.id)
+                    && self
+                        .metadata
+                        .packages
+                        .iter()
+                        .find(|package| package.id == node.id)
+                        .is_some_and(|package| package.name.replace('-', "_") == crate_name)
+            })
+            .map(|node| &node.id)
+            .collect();
+
+        if target_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let mut dependents = Vec::new();
+        let mut seen = HashSet::new();
+
+        for node in resolve.nodes.iter() {
+            if member_ids.contains(&node.id)
+                && node.dependencies.iter().any(|dep| target_ids.contains(dep))
+                && let Some(package) = self
+                    .metadata
+                    .packages
+                    .iter()
+                    .find(|package| package.id == node.id)
+                && seen.insert(package.name.replace('-', "_"))
+            {
+                dependents.push(package.name.replace('-', "_"));
+            }
+        }
+
+        dependents
+    }
+
+    /// The transitive workspace dependents of a crate (BFS over `workspace_dependents_of`),
+    /// including the crate itself.
+    fn workspace_dependent_closure(&self, crate_name: &str) -> BTreeSet<String> {
+        let mut seen = BTreeSet::new();
+        let mut queue = vec![crate_name.to_string()];
+
+        while let Some(current) = queue.pop() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+
+            for dependent in self.workspace_dependents_of(&current) {
+                if !seen.contains(&dependent) {
+                    queue.push(dependent);
+                }
+            }
+        }
+
+        seen
+    }
+
+    /// Order the crates to replay for a hotpatch so dependencies compile before their dependents.
+    ///
+    /// The tip crate is excluded - it's always recompiled separately through cargo.
+    fn workspace_hotpatch_replay_order(
+        &self,
+        modified_crates: &HashSet<String>,
+    ) -> Result<Vec<String>> {
+        let tip = self.tip_package_name();
+
+        // The crates to replay, excluding the tip
+        let crates: BTreeSet<String> = modified_crates
+            .iter()
+            .filter(|crate_name| **crate_name != tip)
+            .cloned()
+            .collect();
+
+        // In-degree = how many of this crate's workspace deps are also being replayed
+        let mut in_degree: HashMap<String, usize> = crates
+            .iter()
+            .map(|crate_name| (crate_name.clone(), 0))
+            .collect();
+        let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
+
+        for crate_name in crates.iter() {
+            for dependent in self.workspace_dependents_of(crate_name) {
+                if crates.contains(&dependent) {
+                    *in_degree.get_mut(&dependent).unwrap() += 1;
+                    dependents
+                        .entry(crate_name.clone())
+                        .or_default()
+                        .push(dependent.clone());
+                }
+            }
+        }
+
+        // Kahn's algorithm with a BTreeSet queue so ties break lexicographically
+        let mut queue: BTreeSet<String> = in_degree
+            .iter()
+            .filter(|&(_, &degree)| degree == 0)
+            .map(|(crate_name, _)| crate_name.clone())
+            .collect();
+
+        let mut order = Vec::new();
+
+        while let Some(current) = queue.iter().next().cloned() {
+            let _ = queue.remove(&current);
+            order.push(current.clone());
+
+            if let Some(dependent_list) = dependents.get(&current) {
+                for dependent in dependent_list {
+                    if let Some(degree) = in_degree.get_mut(dependent) {
+                        *degree -= 1;
+                        if *degree == 0 {
+                            let _ = queue.insert(dependent.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        if order.len() != crates.len() {
+            let unresolved: Vec<String> = in_degree
+                .iter()
+                .filter(|&(_, &degree)| degree > 0)
+                .map(|(crate_name, _)| crate_name.clone())
+                .collect();
+
+            return Err(anyhow!(
+                "Dependency cycle detected among workspace crates: {unresolved:?}"
+            ));
+        }
+
+        Ok(order)
+    }
+
+    /// Get the rustc args for replaying a workspace dependency crate, preferring the lib target.
+    fn workspace_hotpatch_replay_args(
+        &self,
+        workspace_rustc_args: &rustc::WorkspaceRustcArgs,
+        crate_name: &str,
+    ) -> Option<rustc::Args> {
+        let lib_key = format!("{crate_name}.lib");
+        if let Some(args) = workspace_rustc_args.rustc_args.get(&lib_key) {
+            return Some(args.clone());
+        }
+
+        let bin_key = format!("{crate_name}.bin");
+        workspace_rustc_args.rustc_args.get(&bin_key).cloned()
+    }
+
+    /// Resolve the on-disk rlibs for every replayed workspace crate, preserving the link order
+    /// from the original fat build.
+    fn workspace_hotpatch_link_rlibs(
+        &self,
+        workspace_rustc_args: &rustc::WorkspaceRustcArgs,
+        replayed_crates: &[String],
+    ) -> Result<Vec<PathBuf>> {
+        let mut wanted = HashSet::new();
+
+        for crate_name in replayed_crates {
+            let Some(rustc_args) = workspace_rustc_args
+                .rustc_args
+                .get(&format!("{crate_name}.lib"))
+            else {
+                // No capture means the crate wasn't rebuilt (or never built at all) - its code
+                // is still what the fat binary has, so the stubs resolve it as usual.
+                log::debug!(
+                    "Skipping rlib for workspace crate '{crate_name}': no captured rustc args"
+                );
+                continue;
+            };
+
+            let rlib = self
+                .find_rlib_for_crate(crate_name, rustc_args)
+                .with_context(|| {
+                    format!("Could not find rlib for workspace crate '{crate_name}'")
+                })?;
+
+            let _ = wanted.insert(rlib);
+        }
+
+        // Preserve the link order from the original fat build for any rlibs that appear
+        // in the captured link args.
+        let mut ordered = Vec::new();
+        let mut seen = HashSet::new();
+
+        for arg in &workspace_rustc_args.link_args {
+            if !arg.ends_with(".rlib") {
+                continue;
+            }
+
+            let path = PathBuf::from(arg);
+            if wanted.contains(&path) && seen.insert(path.clone()) {
+                ordered.push(path);
+            }
+        }
+
+        // Any rlibs not in the captured link order get appended at the end.
+        let mut remaining: Vec<_> = wanted.into_iter().filter(|p| !seen.contains(p)).collect();
+        remaining.sort();
+        ordered.extend(remaining);
+
+        Ok(ordered)
+    }
+
+    /// Locate the rlib rustc produced for `crate_name` using its captured args.
+    fn find_rlib_for_crate(&self, crate_name: &str, rustc_args: &rustc::Args) -> Result<PathBuf> {
+        // Extract --out-dir from the captured args
+        let out_dir = rustc_args
+            .args
+            .iter()
+            .zip(rustc_args.args.iter().skip(1))
+            .find(|(flag, _)| *flag == "--out-dir")
+            .map(|(_, dir)| PathBuf::from(dir))
+            .with_context(|| format!("No --out-dir in captured rustc args for '{crate_name}'"))?;
+
+        // Extract -C extra-filename from captured args.
+        // Cargo passes this to rustc to disambiguate output filenames via metadata hash.
+        // Handle all forms: `-Cextra-filename=X`, `-C extra-filename=X`, and `-C` `extra-filename=X`.
+        let extra_filename = rustc_args.args.iter().enumerate().find_map(|(i, arg)| {
+            arg.strip_prefix("-Cextra-filename=")
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    if arg == "-C" {
+                        rustc_args.args.get(i + 1).and_then(|next| {
+                            next.strip_prefix("extra-filename=").map(|s| s.to_string())
+                        })
+                    } else {
+                        None
+                    }
+                })
+        });
+
+        // If we have an exact extra-filename, construct the precise rlib path.
+        if let Some(extra) = &extra_filename {
+            let exact = out_dir.join(format!("lib{crate_name}{extra}.rlib"));
+            if exact.exists() {
+                return Ok(exact);
+            }
+        }
+
+        // Fallback: glob for lib<crate_name>-<hash>.rlib in the output directory.
+        // Prefer the most recently modified rlib to avoid picking up stale artifacts.
+        let prefix = format!("lib{crate_name}-");
+        let mut best: Option<(PathBuf, SystemTime)> = None;
+
+        for entry in std::fs::read_dir(&out_dir)
+            .with_context(|| format!("Could not read --out-dir '{}'", out_dir.display()))?
+            .flatten()
+        {
+            if let Some(name) = entry.file_name().to_str()
+                && name.starts_with(&prefix)
+                && name.ends_with(".rlib")
+                && let Ok(meta) = entry.metadata()
+                && let Ok(mtime) = meta.modified()
+                && best.as_ref().is_none_or(|(_, t)| mtime > *t)
+            {
+                best = Some((entry.path(), mtime));
+            }
+        }
+
+        best.map(|(path, _)| path).with_context(|| {
+            format!(
+                "Could not find rlib for '{crate_name}' in {}",
+                out_dir.display()
+            )
+        })
+    }
+
+    /// Recompile a workspace dependency crate using the rustc args captured during the fat build.
+    ///
+    /// The captured args are replayed verbatim (except for the linker override) so the rlib is
+    /// rewritten in place with the latest code, ready to be linked into the patch.
+    async fn compile_dep_crate(&self, crate_name: &str, rustc_args: rustc::Args) -> Result<()> {
+        use tokio::io::AsyncBufReadExt;
+
+        let mut cmd = tokio::process::Command::new("rustc");
+
+        // Drop the linker override - the replay runs the compiler directly and we don't want
+        // to intercept (or loop through) the linker for dependency crates.
+        let args = rustc_args.args[1..]
+            .iter()
+            .filter(|arg| !arg.as_str().starts_with("-Clinker=") && arg.as_str() != "-Clinker")
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let _ = cmd.args(&args);
+
+        // Replay in the captured working directory so relative paths resolve the same way
+        let cwd = if rustc_args.cwd.as_os_str().is_empty() {
+            &self.workspace_dir
+        } else {
+            &rustc_args.cwd
+        };
+        let _ = cmd.current_dir(cwd);
+
+        // Drop the wrapper/linker interception env vars - the replay is a plain rustc invocation
+        let mut envs = rustc_args.envs;
+        envs.retain_mut(|(key, _)| {
+            !key.starts_with("DX_LINK")
+                && !matches!(
+                    key.as_str(),
+                    "RUSTC_WORKSPACE_WRAPPER"
+                        | "RUSTC_WRAPPER"
+                        | "DX_RUSTC"
+                        | "CARGO_MAKEFLAGS"
+                        | "MAKEFLAGS"
+                )
+        });
+        let _ = cmd.env_clear().envs(envs);
+
+        // Wasm needs a different relocation model for thin linking
+        if is_wasm_or_wasi(&self.triple) {
+            let _ = cmd.arg("-Crelocation-model=pic");
+        }
+
+        log::debug!("Replaying rustc for workspace crate '{crate_name}'");
+
+        let mut child = cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("Failed to spawn rustc for dep crate")?;
+
+        let stdout = tokio::io::BufReader::new(child.stdout.take().unwrap());
+        let stderr = tokio::io::BufReader::new(child.stderr.take().unwrap());
+
+        let mut stdout = stdout.lines();
+        let mut stderr = stderr.lines();
+        let mut rendered_diagnostics: Vec<String> = Vec::new();
+
+        loop {
+            use cargo_metadata::Message;
+            use cargo_metadata::diagnostic::Diagnostic;
+
+            let line = tokio::select! {
+                Ok(Some(line)) = stdout.next_line() => line,
+                Ok(Some(line)) = stderr.next_line() => line,
+                else => break,
+            };
+
+            let Some(Ok(message)) = Message::parse_stream(std::io::Cursor::new(line)).next() else {
+                continue;
+            };
+
+            match message {
+                Message::CompilerMessage(msg) => {
+                    println!("{}", msg.message);
+                }
+                Message::TextLine(line) => {
+                    // Direct rustc diagnostics are emitted as JSON on stderr
+                    if let Ok(diag) = serde_json::from_str::<Diagnostic>(&line)
+                        && let Some(rendered) = diag.rendered
+                    {
+                        println!("{rendered}");
+                        rendered_diagnostics.push(rendered);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let status = child.wait().await?;
+
+        if !status.success() {
+            let diagnostics = rendered_diagnostics.join("\n");
+            return Err(anyhow!(
+                "Replay of workspace crate '{crate_name}' failed{}",
+                if diagnostics.is_empty() {
+                    String::new()
+                } else {
+                    format!(":\n{diagnostics}")
+                }
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Load the rustc args the wrapper captured for every crate during the build, along with the
+    /// linker args of the tip crate's final link invocation.
+    fn load_rustc_argset(&self) -> Result<rustc::WorkspaceRustcArgs> {
+        let link_args = std::fs::read_to_string(self.link_args_file())
+            .context("Failed to read link args from file")?
+            .lines()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+
+        let mut workspace_rustc_args = rustc::WorkspaceRustcArgs::new(link_args);
+
+        if let Ok(entries) = std::fs::read_dir(self.rustc_wrapper_args_dir()) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+
+                if path.extension().is_some_and(|ext| ext == "json")
+                    && let Ok(contents) = std::fs::read_to_string(&path)
+                    && let Ok(args) = serde_json::from_str::<rustc::Args>(&contents)
+                    && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+                {
+                    let _ = workspace_rustc_args
+                        .rustc_args
+                        .insert(stem.to_string(), args);
+                }
+            }
+        }
+
+        Ok(workspace_rustc_args)
     }
 
     fn windows_command_file(&self) -> PathBuf {

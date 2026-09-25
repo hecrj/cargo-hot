@@ -1,22 +1,23 @@
 use serde::{Deserialize, Serialize};
 use std::{
     env::{args, vars},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
-/// The environment variable indicating where the args file is located.
+/// The environment variable indicating where the rustc args directory is located.
 ///
-/// When `dx-rustc` runs, it writes its arguments to this file.
+/// When `cargo-hot` runs as a rustc wrapper, it writes the arguments of every crate it wraps to
+/// this directory as `{crate_name}.{lib|bin}.json` files.
 pub const DX_RUSTC_WRAPPER_ENV_VAR: &str = "DX_RUSTC";
 
-/// Is `dx` being used as a rustc wrapper?
+/// Is `cargo-hot` being used as a rustc wrapper?
 ///
-/// This is primarily used to intercept cargo, enabling fast hot-patching by caching the environment
-/// cargo setups up for the user's current project.
+/// This is primarily used to intercept cargo, enabling fast hot-patching by caching the
+/// environment cargo sets up for every crate in the workspace.
 ///
-/// In a differenet world we could simply rely on cargo printing link args and the rustc command, but
-/// it doesn't seem to output that in a reliable, parseable, cross-platform format (ie using command
-/// files on windows...), so we're forced to do this interception nonsense.
+/// In a different world we could simply rely on cargo printing link args and the rustc command,
+/// but it doesn't seem to output that in a reliable, parseable, cross-platform format (ie using
+/// command files on windows...), so we're forced to do this interception nonsense.
 pub fn is_wrapping_rustc() -> bool {
     std::env::var(DX_RUSTC_WRAPPER_ENV_VAR).is_ok()
 }
@@ -25,12 +26,30 @@ pub fn is_wrapping_rustc() -> bool {
 pub struct Args {
     pub args: Vec<String>,
     pub envs: Vec<(String, String)>,
-    /// it doesn't include first program name argument
-    pub link_args: Vec<String>,
     /// The working directory the rustc process was invoked in. Thin builds replay rustc
     /// in this directory so relative paths in the captured args resolve the same way.
     #[serde(default)]
     pub cwd: PathBuf,
+}
+
+/// The rustc args captured for every crate during a build, plus the linker args of the tip
+/// crate's final link invocation.
+///
+/// The `rustc_args` map is keyed by `{crate_name}.{suffix}` where the suffix is `lib` for
+/// lib/rlib crate types and `bin` otherwise, matching the per-crate files the wrapper writes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkspaceRustcArgs {
+    pub link_args: Vec<String>,
+    pub rustc_args: std::collections::HashMap<String, Args>,
+}
+
+impl WorkspaceRustcArgs {
+    pub fn new(link_args: Vec<String>) -> Self {
+        Self {
+            link_args,
+            rustc_args: Default::default(),
+        }
+    }
 }
 
 /// Check if the arguments indicate a linking step, including those in command files.
@@ -81,46 +100,26 @@ pub fn run_rustc() {
         return;
     }
 
-    let var_file: PathBuf = std::env::var(DX_RUSTC_WRAPPER_ENV_VAR)
+    let args_dir: PathBuf = std::env::var(DX_RUSTC_WRAPPER_ENV_VAR)
         .expect("DX_RUSTC not set")
         .into();
 
     let cwd = std::env::current_dir().unwrap_or_default();
 
-    let mut rustc_args = Args {
+    let rustc_args = Args {
         args: args().skip(1).collect::<Vec<_>>(),
         envs: vars().collect::<_>(),
-        link_args: Default::default(),
         cwd,
     };
 
-    // A terrible hack to avoid writing non-sensical args when
-    // a build is completely fresh.
-    if rustc_args
-        .args
-        .iter()
-        .skip_while(|arg| *arg != "--crate-name")
-        .nth(1)
-        .is_some_and(|name| name != "___")
-    {
-        rustc_args
-            .envs
-            .retain_mut(|(key, _)| key != "CARGO_MAKEFLAGS");
-
-        std::fs::create_dir_all(var_file.parent().expect("Failed to get parent dir"))
-            .expect("Failed to create parent dir");
-        std::fs::write(
-            &var_file,
-            serde_json::to_string(&rustc_args).expect("Failed to serialize rustc args"),
-        )
-        .expect("Failed to write rustc args to file");
-    }
+    // Persist the captured args so thin builds can replay them later.
+    write_rustc_args(&args_dir, &rustc_args);
 
     // Run the actual rustc command
     // We want all stdout/stderr to be inherited, so the running process can see the output
     //
-    // Note that the args format we get from the wrapper includes the `rustc` command itself, so we
-    // need to skip that - we already skipped the first arg when we created the args struct.
+    // Note that the args format we get from the wrapper includes the `rustc` command itself, so
+    // we need to skip that - we already skipped the first arg when we created the args struct.
     let rustc = std::process::Command::new("rustc")
         .args(rustc_args.args.iter().skip(1))
         .envs(rustc_args.envs)
@@ -131,4 +130,48 @@ pub fn run_rustc() {
 
     // Propagate the exit code
     std::process::exit(rustc.unwrap().code().unwrap())
+}
+
+/// Write the captured rustc args to `{args_dir}/{crate_name}.{suffix}.json`.
+///
+/// The suffix is `lib` for lib/rlib crate types and `bin` otherwise. Crates without a
+/// `--crate-name` argument (like the linker driver invocations) and cargo's `___` probe
+/// crate are skipped.
+fn write_rustc_args(args_dir: &Path, rustc_args: &Args) {
+    let Some(crate_name) = rustc_args
+        .args
+        .iter()
+        .skip_while(|arg| *arg != "--crate-name")
+        .nth(1)
+    else {
+        return;
+    };
+
+    // A terrible hack to avoid writing non-sensical args when a build is completely fresh.
+    if crate_name == "___" {
+        return;
+    }
+
+    let crate_type: Option<&str> = rustc_args
+        .args
+        .iter()
+        .skip_while(|arg| *arg != "--crate-type")
+        .nth(1)
+        .map(|s| s.as_str());
+    let suffix = match crate_type {
+        Some("lib" | "rlib") => "lib",
+        _ => "bin",
+    };
+
+    // Drop the makeflags since they're tied to this specific cargo invocation and would
+    // confuse a later replay of the captured args.
+    let mut serialized = rustc_args.clone();
+    serialized.envs.retain(|(key, _)| key != "CARGO_MAKEFLAGS");
+
+    std::fs::create_dir_all(args_dir).expect("Failed to create rustc args dir");
+    std::fs::write(
+        args_dir.join(format!("{crate_name}.{suffix}.json")),
+        serde_json::to_string(&serialized).expect("Failed to serialize rustc args"),
+    )
+    .expect("Failed to write rustc args to file");
 }
