@@ -29,7 +29,7 @@ async fn main() -> Result<ExitCode> {
     tracing_subscriber::fmt::init();
 
     if rustc::is_wrapping_rustc() {
-        rustc::run_rustc().await;
+        rustc::run_rustc();
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -620,12 +620,10 @@ impl Server {
                 }
                 // todo: this can occasionally swallow errors, so we should figure out what exactly is going wrong
                 //       since that is a really bad user experience.
-                Message::BuildFinished(finished) => {
-                    if !finished.success {
-                        return Err(anyhow::anyhow!(
-                            "Cargo build failed, signaled by the compiler. Toggle tracing mode (press `t`) for more information."
-                        ));
-                    }
+                Message::BuildFinished(finished) if !finished.success => {
+                    return Err(anyhow::anyhow!(
+                        "Cargo build failed, signaled by the compiler. Toggle tracing mode (press `t`) for more information."
+                    ));
                 }
                 _ => {}
             }
@@ -780,9 +778,7 @@ impl Server {
         // Requiring the ASLR offset here is necessary but unfortunately might be flakey in practice.
         // Android apps can take a long time to open, and a hot patch might've been issued in the interim,
         // making this hotpatch a failure.
-        if self.triple.architecture != Architecture::Wasm32
-            && self.triple.architecture != Architecture::Wasm64
-        {
+        if !is_wasm_or_wasi(&self.triple) {
             let stub_bytes = hotpatch::create_undefined_symbol_stub(
                 cache,
                 &object_files,
@@ -832,6 +828,14 @@ impl Server {
             out_args = vec![format!("@{}", self.windows_command_file().display()).into()];
         }
 
+        // Add more search paths for the linker
+        let mut command_envs: Vec<(String, String)> = rustc_args.envs.clone();
+
+        // On linux, we need to set a more complete PATH for the linker to find its libraries
+        if cfg!(target_os = "linux") {
+            command_envs.push(("PATH".to_string(), std::env::var("PATH").unwrap()));
+        }
+
         // Run the linker directly!
         //
         // We dump its output directly into the patch exe location which is different than how rustc
@@ -839,7 +843,7 @@ impl Server {
         let res = tokio::process::Command::new(linker)
             .args(out_args)
             .env_clear()
-            .envs(rustc_args.envs.iter().map(|(k, v)| (k, v)))
+            .envs(command_envs.iter().map(|(k, v)| (k, v)))
             .output()
             .await?;
 
@@ -968,10 +972,22 @@ impl Server {
                 // Preserve the original args. We only preserve:
                 // -framework
                 // -arch
+                // -L <path>
                 // -lxyz
+                // -m (arch/emulation)
+                // -target
+                // -isysroot (iOS only)
+                // -nodefaultlibs
+                // -fuse-ld (linker selection)
                 // There might be more, but some flags might break our setup.
                 for (idx, arg) in original_args.iter().enumerate() {
-                    if *arg == "-framework" || *arg == "-arch" || *arg == "-L" {
+                    if *arg == "-framework"
+                        || *arg == "-arch"
+                        || *arg == "-L"
+                        || *arg == "-target"
+                        || (*arg == "-isysroot"
+                            && matches!(self.triple.operating_system, OperatingSystem::IOS(_)))
+                    {
                         out_args.push(arg.to_string());
                         out_args.push(original_args[idx + 1].to_string());
                     }
@@ -980,6 +996,7 @@ impl Server {
                         || arg.starts_with("-m")
                         || arg.starts_with("-Wl,-fuse-ld")
                         || arg.starts_with("-fuse-ld")
+                        || arg.starts_with("-nodefaultlibs")
                     {
                         out_args.push(arg.to_string());
                     }
@@ -1001,8 +1018,12 @@ impl Server {
 
                 // Preserve the original args. We only preserve:
                 // -L <path>
-                // -arch
                 // -lxyz
+                // -m (arch/emulation)
+                // -B<path>  (gcc program search path — Rust 1.86+ injects -B/gcc-ld + -fuse-ld=lld
+                //            so that cc picks up the bundled lld; we must forward it for the patch
+                //            linker invocation too, otherwise cc falls back to the system `ld`)
+                // -fuse-ld  (linker selection)
                 // There might be more, but some flags might break our setup.
                 for (idx, arg) in original_args.iter().enumerate() {
                     if *arg == "-L" {
@@ -1015,6 +1036,8 @@ impl Server {
                         || arg.starts_with("-Wl,--target=")
                         || arg.starts_with("-Wl,-fuse-ld")
                         || arg.starts_with("-fuse-ld")
+                        || arg.starts_with("-B")
+                        || arg.contains("-ld-path")
                     {
                         out_args.push(arg.to_string());
                     }
@@ -1056,7 +1079,9 @@ impl Server {
             out_args.push(vale);
         }
 
-        if let Some(vale) = extract_value("-isysroot") {
+        if let Some(vale) = extract_value("-isysroot")
+            && matches!(self.triple.operating_system, OperatingSystem::IOS(_))
+        {
             out_args.push("-isysroot".to_string());
             out_args.push(vale);
         }
@@ -1330,8 +1355,7 @@ impl Server {
                 args.push("-Wl,--export-dynamic-symbol,main".to_string());
             }
             LinkerFlavor::Darwin => {
-                // `-all_load` is an extra step to ensure that all symbols are loaded (different than force_load)
-                args.push("-Wl,-all_load".to_string());
+                args.push("-Wl,-exported_symbol,_main".to_string());
             }
             LinkerFlavor::Msvc => {
                 // Prevent alsr from overflowing 32 bits
@@ -1358,13 +1382,11 @@ impl Server {
             let _ = args.remove(idx);
         }
 
-        // TODO
         // We want to go through wasm-ld directly, so we need to remove the -flavor flag
-        // if self.platform == Platform::Web {
-        //     let flavor_idx = args.iter().position(|arg| *arg == "-flavor").unwrap();
-        //     args.remove(flavor_idx + 1);
-        //     args.remove(flavor_idx);
-        // }
+        if let Some(flavor_idx) = args.iter().position(|arg| *arg == "-flavor") {
+            let _ = args.remove(flavor_idx + 1);
+            let _ = args.remove(flavor_idx);
+        }
 
         // Set the output file
         match self.triple.operating_system {
@@ -1384,31 +1406,36 @@ impl Server {
         // Handle windows command files
         let mut out_args = args.clone();
         if cfg!(windows) {
-            let cmd_contents: String = out_args
-                .iter()
-                .skip(1)
-                .map(|f| format!("\"{f}\""))
-                .join(" ");
+            let cmd_contents: String = out_args.iter().map(|f| format!("\"{f}\"")).join(" ");
             std::fs::write(self.windows_command_file(), cmd_contents)
                 .context("Failed to write linker command file")?;
             out_args = vec![format!("@{}", self.windows_command_file().display())];
+        }
+
+        // Add more search paths for the linker
+        let mut command_envs: Vec<(String, String)> = rustc_args.envs.clone();
+
+        // On linux, we need to set a more complete PATH for the linker to find its libraries
+        if cfg!(target_os = "linux") {
+            command_envs.push(("PATH".to_string(), std::env::var("PATH").unwrap()));
         }
 
         // Run the linker directly!
         let res = tokio::process::Command::new(linker)
             .args(out_args)
             .env_clear()
-            .envs(rustc_args.envs.iter().map(|(k, v)| (k, v)))
+            .envs(command_envs.iter().map(|(k, v)| (k, v)))
             .output()
             .await?;
 
-        if !res.stderr.is_empty() {
-            let errs = String::from_utf8_lossy(&res.stderr);
-            if !res.status.success() {
-                log::error!("Failed to generate fat binary: {}", errs.trim());
-            } else {
-                log::trace!("Warnings during fat linking: {}", errs.trim());
+        if !res.status.success() {
+            let mut combined = String::from_utf8_lossy(&res.stderr).into_owned();
+            let out = String::from_utf8_lossy(&res.stdout);
+            if !out.trim().is_empty() {
+                combined = format!("{combined}\n{out}");
             }
+            log::error!("Failed to generate fat binary:\n{}", combined.trim());
+            return Err(anyhow::anyhow!("Failed to generate fat binary"));
         }
 
         if !res.stdout.is_empty() {
@@ -1581,8 +1608,17 @@ impl Server {
             BuildMode::Thin { rustc_args, .. } => {
                 let mut cmd = tokio::process::Command::new("rustc");
 
+                // Replay the build in the working directory captured by the rustc wrapper when
+                // the args were recorded, falling back to the workspace dir for old captures
+                // that predate the field (serde(default) gives an empty path).
+                let cwd = if rustc_args.cwd.as_os_str().is_empty() {
+                    &self.workspace_dir
+                } else {
+                    &rustc_args.cwd
+                };
+
                 let _ = cmd
-                    .current_dir(&self.workspace_dir)
+                    .current_dir(cwd)
                     .env_clear()
                     .args(rustc_args.args[1..].iter())
                     .env_remove("RUSTC_WORKSPACE_WRAPPER")
@@ -1591,10 +1627,9 @@ impl Server {
                     .envs(self.cargo_build_env_vars(mode)?)
                     .arg(format!("-Clinker={}", path_to_me()?.display()));
 
-                // TODO
-                // if self.platform == Platform::Web {
-                //     cmd.arg("-Crelocation-model=pic");
-                // }
+                if is_wasm_or_wasi(&self.triple) {
+                    let _ = cmd.arg("-Crelocation-model=pic");
+                }
 
                 log::debug!("Direct rustc: {cmd:#?}");
 
@@ -1695,7 +1730,12 @@ impl Server {
         cargo_args.push("--".to_string());
         cargo_args.extend(self.extra_rustc_args.clone());
 
-        if cfg!(target_os = "windows") {
+        if cfg!(target_os = "windows")
+            && !self
+                .extra_rustc_args
+                .iter()
+                .any(|f| f.starts_with("-Clink-arg=/SUBSYSTEM:"))
+        {
             // On windows, we pass /SUBSYSTEM:WINDOWS to prevent a console from appearing
             cargo_args.push("-Clink-arg=/SUBSYSTEM:WINDOWS".to_string());
             // We also need to set the entry point to mainCRTStartup to avoid windows looking
@@ -1806,19 +1846,17 @@ impl Server {
             // https://blog.rust-lang.org/2024/09/24/webassembly-targets-change-in-default-target-features/#disabling-on-by-default-webassembly-proposals
             //
             // It's fine that these exist in the base module but not in the patch.
-            // if self.platform == Platform::Web
-            //     || self.triple.operating_system == OperatingSystem::Wasi
-            // {
-            //     cargo_args.push("-Ctarget-cpu=mvp".into());
-            //     cargo_args.push("-Clink-arg=--no-gc-sections".into());
-            //     cargo_args.push("-Clink-arg=--growable-table".into());
-            //     cargo_args.push("-Clink-arg=--export-table".into());
-            //     cargo_args.push("-Clink-arg=--export-memory".into());
-            //     cargo_args.push("-Clink-arg=--emit-relocs".into());
-            //     cargo_args.push("-Clink-arg=--export=__stack_pointer".into());
-            //     cargo_args.push("-Clink-arg=--export=__heap_base".into());
-            //     cargo_args.push("-Clink-arg=--export=__data_end".into());
-            // }
+            if is_wasm_or_wasi(&self.triple) {
+                // cargo_args.push("-Ctarget-cpu=mvp".into()); // disabled due to changes in wasm-bindgen
+                cargo_args.push("-Clink-arg=--no-gc-sections".into());
+                cargo_args.push("-Clink-arg=--growable-table".into());
+                cargo_args.push("-Clink-arg=--export-table".into());
+                cargo_args.push("-Clink-arg=--export-memory".into());
+                cargo_args.push("-Clink-arg=--emit-relocs".into());
+                cargo_args.push("-Clink-arg=--export=__stack_pointer".into());
+                cargo_args.push("-Clink-arg=--export=__heap_base".into());
+                cargo_args.push("-Clink-arg=--export=__data_end".into());
+            }
         }
 
         cargo_args
@@ -1914,6 +1952,14 @@ async fn read_batch<T>(
     }
 
     n
+}
+
+/// Whether the target triple is a wasm32/wasm64 or wasi target.
+fn is_wasm_or_wasi(triple: &Triple) -> bool {
+    matches!(
+        triple.architecture,
+        target_lexicon::Architecture::Wasm32 | target_lexicon::Architecture::Wasm64
+    ) || triple.operating_system == target_lexicon::OperatingSystem::Wasi
 }
 
 /// Detects if `dx` is being ran in a WSL environment.

@@ -109,9 +109,9 @@ impl LinkAction {
         Ok(())
     }
 
-    pub(crate) async fn run_link(self) {
+    pub(crate) fn run_link(self) {
         let link_err_file = self.link_err_file.clone();
-        let res = self.run_link_inner().await;
+        let res = self.run_link_inner();
 
         if let Err(err) = res {
             // If we failed to run the linker, we need to write the error to the file
@@ -125,7 +125,7 @@ impl LinkAction {
     ///
     /// The file will be given by the dx-magic-link-arg env var itself, so we use
     /// it both for determining if we should act as a linker and the for the file name itself.
-    async fn run_link_inner(self) -> Result<()> {
+    fn run_link_inner(self) -> Result<()> {
         let args: Vec<_> = std::env::args().collect();
         if args.is_empty() {
             return Ok(());
@@ -147,7 +147,7 @@ impl LinkAction {
             Some(linker) => {
                 let mut cmd = std::process::Command::new(linker);
                 let _ = match cfg!(target_os = "windows") {
-                    true => cmd.arg(format!("@{}", &self.link_args_file.display())),
+                    true => cmd.arg(format!("@{}", self.link_args_file.display())),
                     false => cmd.args(args),
                 };
                 let res = cmd.output().expect("Failed to run linker");
@@ -249,7 +249,9 @@ pub fn handle_linker_arg_response_file(arg: String) -> Vec<String> {
         let mut content = String::from_utf8(file_binary.clone()).unwrap_or_else(|_| {
             // Convert Vec<u8> to Vec<u16> to convert into a String
             let binary_u16le: Vec<u16> = file_binary
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|a| u16::from_le_bytes([a[0], a[1]]))
                 .collect();
 

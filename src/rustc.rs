@@ -25,7 +25,12 @@ pub fn is_wrapping_rustc() -> bool {
 pub struct Args {
     pub args: Vec<String>,
     pub envs: Vec<(String, String)>,
+    /// it doesn't include first program name argument
     pub link_args: Vec<String>,
+    /// The working directory the rustc process was invoked in. Thin builds replay rustc
+    /// in this directory so relative paths in the captured args resolve the same way.
+    #[serde(default)]
+    pub cwd: PathBuf,
 }
 
 /// Check if the arguments indicate a linking step, including those in command files.
@@ -43,7 +48,9 @@ fn has_linking_args() -> bool {
             // Handle both UTF-8 and UTF-16LE encodings for response files.
             let content = String::from_utf8(file_binary.clone()).unwrap_or_else(|_| {
                 let binary_u16le: Vec<u16> = file_binary
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|a| u16::from_le_bytes([a[0], a[1]]))
                     .collect();
                 String::from_utf16_lossy(&binary_u16le)
@@ -65,23 +72,26 @@ fn has_linking_args() -> bool {
 /// Run rustc directly, but output the result to a file.
 ///
 /// <https://doc.rust-lang.org/cargo/reference/config.html#buildrustc>
-pub async fn run_rustc() {
+pub fn run_rustc() {
     // If we are being asked to link, delegate to the linker action.
     if has_linking_args() {
-        return crate::link::LinkAction::from_env()
+        crate::link::LinkAction::from_env()
             .expect("Linker action not found")
-            .run_link()
-            .await;
+            .run_link();
+        return;
     }
 
     let var_file: PathBuf = std::env::var(DX_RUSTC_WRAPPER_ENV_VAR)
         .expect("DX_RUSTC not set")
         .into();
 
+    let cwd = std::env::current_dir().unwrap_or_default();
+
     let mut rustc_args = Args {
         args: args().skip(1).collect::<Vec<_>>(),
         envs: vars().collect::<_>(),
         link_args: Default::default(),
+        cwd,
     };
 
     // A terrible hack to avoid writing non-sensical args when
